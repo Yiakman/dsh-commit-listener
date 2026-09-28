@@ -1,0 +1,6 @@
+# Patch-list overlay: load the commit-listener plugin into any dsh profile.
+# Usage: dsh web --patch /Users/eduardosoto/Code/dsh-commit-listener/cordis.patch.yml
+# (or paste the insert entry into the profile's user patch layer)
+- insert:
+    - id: commit-listener
+      name: /Users/eduardosoto/Code/dsh-commit-listener/commit-listener.js
