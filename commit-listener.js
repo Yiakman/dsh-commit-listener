@@ -24,7 +24,7 @@ export const name = 'commit-listener'
 export const inject = ['commands']
 
 export const DEFAULT_PROMPT =
-  'Analyze the changes in the reported commit(s): summarize the technical impact and flag possible risks.'
+  'Analyze the changes in the reported commit(s): summarize the technical impact and flag possible risks. Suggest fixes, improvements and simplifications.'
 
 export function apply(ctx) {
   const listeners = new Map() // agent id -> stop()
