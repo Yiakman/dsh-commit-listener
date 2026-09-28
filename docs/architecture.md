@@ -81,10 +81,10 @@ only at a turn boundary. The poll loop stays decoupled from agent activity.
 
 ```js
 {
-  id: randomUUID(),                                  // non-empty, dedup-checked
-  role: 'user',                                      // validated at log append
-  content: [{ type: 'text', text }],                 // must be an array
-  source: { kind: 'plugin', plugin: 'commit-listener' },
+  id: randomUUID(),                     // non-empty, dedup-checked
+  role: 'user',                         // validated at log append
+  content: [{ type: 'text', text }],    // must be an array
+  source: { kind: 'commit-listener' },  // producer-owned kind (format v4)
 }
 ```
 
@@ -92,6 +92,16 @@ The inbox projection rejects duplicate pending ids, and
 `assertMessageEventShape` (dsh-session) validates `id`/`role`/`source.kind`/
 `content` when the turn appends `user/message`. The report's draft omitted
 `id` and `role` — that message would fail both gates.
+
+**Format v4 note (DSH ≥ 0.1.7):** the generic `{kind: 'plugin', plugin: name}`
+wrapper is retired (`dsh-session-format-v3-to-v4` refuses it: "format v4
+message requires a producer-owned source kind"). Each producer owns its kind —
+first-party plugins write `{kind: 'schedule'}`, `{kind: 'tmux-context'}`, so a
+third-party plugin writes its own name: `{kind: 'commit-listener'}`. The v3
+validator accepted any non-empty kind, so this shape also runs on 0.1.5
+hosts. A plugin emitting the retired wrapper appends fine in memory and then
+fails at persistence, poisoning the session's projection cache — the observed
+"This turn failed" in the field.
 
 ## 4. The session log invariant
 

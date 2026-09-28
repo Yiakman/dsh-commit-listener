@@ -46,7 +46,7 @@ export function apply(ctx) {
   ctx.commands.register({
     name: 'commit-listen',
     description:
-      'Watch the session workspace git repo; each new commit becomes one agent turn running the given analysis prompt.',
+      'Watch the session workspace git repo; each new commit becomes one agent turn running the given analysis prompt. (v2, format-v4 source kinds)',
     input: { hint: '<analysis prompt> | off' },
     handler: async ({ agent, rawInput }) => {
       const arg = (rawInput ?? '').trim()
@@ -169,12 +169,14 @@ function truncate(diff) {
 }
 
 /** One identified user message, exactly the shape the inbox and the
- *  user/message log event validate (non-empty id, role, source.kind, content). */
+ *  user/message log event validate (non-empty id, role, source.kind, content).
+ *  Format v4 retired the generic `{kind: 'plugin', plugin}` wrapper: each
+ *  producer owns its kind (see dsh-session-format-v3-to-v4). */
 export function createUserMessage(text) {
   return {
     id: randomUUID(),
     role: 'user',
     content: [{ type: 'text', text }],
-    source: { kind: 'plugin', plugin: 'commit-listener' },
+    source: { kind: 'commit-listener' },
   }
 }

@@ -98,7 +98,7 @@ assert.equal(agent.followups.length, 1, 'burst coalesces into one followup')
 const message = agent.followups[0]
 assert.equal(message.role, 'user')
 assert.ok(typeof message.id === 'string' && message.id !== '', 'message has a non-empty id')
-assert.deepEqual(message.source, { kind: 'plugin', plugin: 'commit-listener' })
+assert.deepEqual(message.source, { kind: 'commit-listener' })
 assert.equal(message.content.length, 1)
 assert.equal(message.content[0].type, 'text')
 const text = message.content[0].text
