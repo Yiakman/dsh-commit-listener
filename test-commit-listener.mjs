@@ -240,11 +240,35 @@ result = await invoke(`--worktree=${feat.path}`)
 assert.equal(result.kind, 'success')
 assert.match(result.text, /feature-x/)
 
-// --- --worktree=<unknown>: error lists the known worktrees -------------------
+// --- --worktree=<unknown>: error carries the discovery listing ---------------
 result = await invoke('--worktree=nope')
 assert.equal(result.kind, 'error')
 assert.match(result.text, /No worktree matches "nope"/)
+assert.match(result.text, /Available worktrees \(--worktree=<name\|path>\):/)
 assert.match(result.text, /feat-x/)
+
+// --- discovery: bare or empty --worktree lists worktrees, starts nothing ------
+for (const flag of ['--worktree', '--worktree=']) {
+  result = await invoke(flag)
+  assert.equal(result.kind, 'error', `${flag} settles without starting a listener`)
+  assert.match(result.text, /No worktree selected\./)
+  assert.match(result.text, /Available worktrees \(--worktree=<name\|path>\):/)
+  assert.match(result.text, /main\s+[0-9a-f]{7}\s+\S*\/repo\s+\(session worktree\)/)
+  assert.match(result.text, /feature-x\s+[0-9a-f]{7}\s+\S+feat-x$/m)
+}
+
+// --- discovery is read-only: an active listener survives it -------------------
+result = await invoke('') // default listener active again
+assert.equal(result.kind, 'success')
+result = await invoke('--worktree')
+assert.equal(result.kind, 'error')
+await commitFile(repo, 'm4.txt', 'm4\n', 'main commit 4')
+await sleep(POLL_MS + 1500)
+assert.equal(agent.followups.length, 8, 'listener survived the discovery query')
+
+await commitFile(featDir, 'w4.txt', 'w4\n', 'feat: worktree commit 4')
+await sleep(POLL_MS + 1500)
+assert.equal(agent.followups.length, 8, 'discovery neither replaced nor widened the listener')
 
 rmSync(root, { recursive: true, force: true })
 console.log('commit-listener self-check: all assertions passed')

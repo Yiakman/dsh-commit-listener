@@ -255,8 +255,9 @@ Scoping modes derived from that listing:
 | `/commit-listen` | The worktree containing the session workspace — `rev-parse --show-toplevel` matched against the listing. |
 | `/commit-listen --all` | Every registered worktree; `bare` and unborn (all-zero `HEAD`) entries skipped, worktrees registered after start baselined silently at their current HEAD. |
 | `/commit-listen --worktree=<name\|path>` | One worktree: resolved-path match first (symlinks normalized the way git prints them), then a unique basename — the worktree's name. |
+| `/commit-listen --worktree` (bare or empty value) | None — a read-only, UI-only listing of every registered worktree (branch, short HEAD, path, markers, session tag). |
 
-Each changed worktree produces exactly one `followup()`, so every agent turn carries a single worktree's `Worktree:` path and branch — the agent learns not just *what* changed but *where*. Flags are parsed as whole tokens, so a prompt may legitimately contain the text `--all`.
+Each changed worktree produces exactly one `followup()`, so every agent turn carries a single worktree's `Worktree:` path and branch — the agent learns not just *what* changed but *where*. Flags are parsed as whole tokens, so a prompt may legitimately contain the text `--all`. A bare or valueless `--worktree` is a discovery query: the handler settles with `{kind: 'error'}` carrying the listing (the command runtime accepts only `success` and `error`, and `success` would wrongly imply a listener started); the result renders UI-only at zero tokens, and because discovery precedes restart disposal, an active listener keeps running. The same listing accompanies the no-match/ambiguous `--worktree=<target>` error.
 
 ### The Three Deterministic Disposal Paths
 

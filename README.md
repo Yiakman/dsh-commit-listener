@@ -29,6 +29,7 @@ The patch layer hot-reloads on long-lived surfaces (`patchReload: "live"`); othe
 /commit-listen                                # session worktree, default prompt
 /commit-listen Focus on security risks        # session worktree, custom prompt
 /commit-listen --all                          # every registered worktree
+/commit-listen --worktree                     # list available worktrees
 /commit-listen --worktree=feat-x              # one worktree, by name or path
 /commit-listen off                            # stop watching
 ```
@@ -41,7 +42,10 @@ The patch layer hot-reloads on long-lived surfaces (`patchReload: "live"`); othe
   **session workspace** (`agent.session.header.cwd`) — linked worktrees hold
   private HEADs, so sibling commits never fire a turn. `--all` watches every
   registered worktree (bare and unborn skipped, late arrivals baselined
-  silently); `--worktree=<name|path>` binds to exactly one.
+  silently); `--worktree=<name|path>` binds to exactly one. A bare or empty
+  `--worktree` is a read-only discovery query: it lists every registered
+  worktree (branch, short HEAD, path, session marker) as a UI-only result and
+  starts nothing — an active listener survives it.
 - Stops on `/commit-listen off`, on session close (`agent/disposed`), and on plugin
   unload/HMR (`ctx.effect` disposer).
 - Commands never consume model context: results render in the UI only, while

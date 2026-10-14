@@ -53,8 +53,8 @@ export function apply(ctx) {
   ctx.commands.register({
     name: 'commit-listen',
     description:
-      'Watch the session worktree for new commits (--all: every linked worktree; --worktree=<name|path>: one specific worktree); each new commit becomes one agent turn running the analysis prompt.',
-    input: { hint: '[--all | --worktree=<name|path>] <prompt> | off' },
+      'Watch the session worktree for new commits (--all: every linked worktree; --worktree=<name|path>: one specific worktree — bare or empty lists them); each new commit becomes one agent turn running the analysis prompt.',
+    input: { hint: '[--all | --worktree[=<name|path>]] <prompt> | off' },
     handler: async ({ agent, rawInput }) => {
       const arg = (rawInput ?? '').trim()
 
@@ -67,12 +67,15 @@ export function apply(ctx) {
       }
 
       // Flags are whole tokens, so a prompt may legitimately contain "--all".
-      // The remaining words form the analysis prompt.
+      // The remaining words form the analysis prompt. A bare or empty
+      // --worktree is a discovery query: list worktrees, start nothing.
       let mode = 'current' // 'current' | 'all' | 'worktree'
       let target
+      let discover = false
       const words = []
       for (const token of arg.split(/\s+/).filter(Boolean)) {
         if (token === '--all') mode = 'all'
+        else if (token === '--worktree' || token === '--worktree=') discover = true
         else if (token.startsWith('--worktree=')) {
           mode = 'worktree'
           target = token.slice('--worktree='.length)
@@ -82,10 +85,6 @@ export function apply(ctx) {
       // The session's own workspace, not the server process cwd: each chat can
       // listen to a different repository.
       const cwd = agent.session.header.cwd ?? process.cwd()
-
-      // Restart semantics: a second invocation replaces the first.
-      listeners.get(agent.id)?.()
-      listeners.delete(agent.id)
 
       // One porcelain listing resolves every mode: worktree paths, HEADs and
       // branches. It also validates the repo — works from subdirectories,
@@ -97,6 +96,18 @@ export function apply(ctx) {
         return { kind: 'error', text: `Cannot read git repo at ${cwd}: ${shortError(error)}` }
       }
 
+      // Discovery: settle with a UI-only listing and start nothing. It is
+      // read-only — an active listener survives the query (no restart
+      // disposal), and 'error' is deliberate: the command runtime accepts
+      // only success|error, and success would imply a listener started.
+      if (discover) {
+        return { kind: 'error', text: `No worktree selected. ${await worktreeListing(worktrees, cwd)}` }
+      }
+
+      // Restart semantics: a second invocation replaces the first.
+      listeners.get(agent.id)?.()
+      listeners.delete(agent.id)
+
       // Worktree path -> last seen { path, head, branch, bare }
       const watched = new Map()
       if (mode === 'all') {
@@ -107,14 +118,16 @@ export function apply(ctx) {
       } else if (mode === 'worktree') {
         const wt = resolveWorktree(worktrees, target, cwd)
         if (!wt) {
-          const known = worktrees.map((w) => basename(w.path)).join(', ')
-          return { kind: 'error', text: `No worktree matches "${target}". Known worktrees: ${known}.` }
+          return {
+            kind: 'error',
+            text: `No worktree matches "${target}". ${await worktreeListing(worktrees, cwd)}`,
+          }
         }
         if (isUnborn(wt.head)) return { kind: 'error', text: `Worktree ${wt.path} has no commits yet.` }
         watched.set(wt.path, wt)
       } else {
         // Default: strictly the worktree containing the session workspace.
-        const topLevel = await git(['rev-parse', '--show-toplevel'], cwd).then((out) => out.trim()).catch(() => '')
+        const topLevel = await sessionTopLevel(cwd)
         const wt = worktrees.find((entry) => entry.path === topLevel)
         if (!wt || wt.bare) return { kind: 'error', text: `Current directory (${cwd}) is not a git worktree.` }
         if (isUnborn(wt.head)) return { kind: 'error', text: `Worktree ${wt.path} has no commits yet.` }
@@ -229,6 +242,33 @@ function resolveWorktree(worktrees, target, cwd) {
   if (byPath) return byPath
   const byName = worktrees.filter((wt) => basename(wt.path) === target)
   return byName.length === 1 ? byName[0] : undefined
+}
+
+/** The worktree root containing `cwd`, git-resolved the same way porcelain
+ *  prints worktree paths ('' when cwd is not inside any worktree). */
+async function sessionTopLevel(cwd) {
+  try {
+    return (await git(['rev-parse', '--show-toplevel'], cwd)).trim()
+  } catch {
+    return ''
+  }
+}
+
+/** UI-only discovery listing: one line per registered worktree with branch,
+ *  short HEAD, path and markers; the session's own worktree is tagged. */
+async function worktreeListing(worktrees, cwd) {
+  const sessionTop = await sessionTopLevel(cwd)
+  const rows = worktrees.map((wt) => {
+    const markers = [
+      wt.bare ? 'bare' : '',
+      wt.branch === '(detached)' ? 'detached' : '',
+      isUnborn(wt.head) ? 'no commits yet' : '',
+      wt.path === sessionTop ? 'session worktree' : '',
+    ].filter(Boolean)
+    const head = wt.head ? wt.head.slice(0, 7) : '-'
+    return `  ${wt.branch.padEnd(14)}${head.padEnd(9)}${wt.path}${markers.length ? `  (${markers.join(', ')})` : ''}`
+  })
+  return `Available worktrees (--worktree=<name|path>):\n${rows.join('\n')}`
 }
 
 /** Build the full turn text for one observed HEAD movement in one worktree. */
