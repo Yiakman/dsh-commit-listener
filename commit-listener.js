@@ -4,14 +4,21 @@
 // the agent as a formal new turn (agent.followup → next-turn inbox), so the
 // analysis lands in the append-only session log like any user message.
 //
+// Worktree-aware: linked worktrees share one object database but hold private
+// HEADs, so a commit in a sibling worktree never moves this worktree's HEAD.
+// The default scope is the worktree containing the session workspace;
+// --all watches every registered worktree and --worktree=<name|path> binds to
+// one. All resolution goes through `git worktree list --porcelain`.
+//
 // Install through a profile patch layer (~/.dsh/profiles/<name>/cordis.patch.yml):
 //   - insert:
 //       - id: commit-listener
 //         name: /absolute/path/to/commit-listener.js
 
 import { execFile } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
+import { basename, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
@@ -46,8 +53,8 @@ export function apply(ctx) {
   ctx.commands.register({
     name: 'commit-listen',
     description:
-      'Watch the session workspace git repo; each new commit becomes one agent turn running the given analysis prompt. (v2, format-v4 source kinds)',
-    input: { hint: '<analysis prompt> | off' },
+      'Watch the session worktree for new commits (--all: every linked worktree; --worktree=<name|path>: one specific worktree); each new commit becomes one agent turn running the analysis prompt.',
+    input: { hint: '[--all | --worktree=<name|path>] <prompt> | off' },
     handler: async ({ agent, rawInput }) => {
       const arg = (rawInput ?? '').trim()
 
@@ -59,7 +66,19 @@ export function apply(ctx) {
         return { kind: 'success', text: 'Commit listener stopped.' }
       }
 
-      const prompt = arg || DEFAULT_PROMPT
+      // Flags are whole tokens, so a prompt may legitimately contain "--all".
+      // The remaining words form the analysis prompt.
+      let mode = 'current' // 'current' | 'all' | 'worktree'
+      let target
+      const words = []
+      for (const token of arg.split(/\s+/).filter(Boolean)) {
+        if (token === '--all') mode = 'all'
+        else if (token.startsWith('--worktree=')) {
+          mode = 'worktree'
+          target = token.slice('--worktree='.length)
+        } else words.push(token)
+      }
+      const prompt = words.join(' ') || DEFAULT_PROMPT
       // The session's own workspace, not the server process cwd: each chat can
       // listen to a different repository.
       const cwd = agent.session.header.cwd ?? process.cwd()
@@ -68,15 +87,40 @@ export function apply(ctx) {
       listeners.get(agent.id)?.()
       listeners.delete(agent.id)
 
-      let start
+      // One porcelain listing resolves every mode: worktree paths, HEADs and
+      // branches. It also validates the repo — works from subdirectories,
+      // linked worktrees and bare repositories alike.
+      let worktrees
       try {
-        start = (await git(['rev-parse', 'HEAD'], cwd)).trim()
+        worktrees = parseWorktrees(await git(['worktree', 'list', '--porcelain'], cwd))
       } catch (error) {
         return { kind: 'error', text: `Cannot read git repo at ${cwd}: ${shortError(error)}` }
       }
-      const branch = (await git(['rev-parse', '--abbrev-ref', 'HEAD'], cwd).catch(() => 'HEAD')).trim()
 
-      let known = start
+      // Worktree path -> last seen { path, head, branch, bare }
+      const watched = new Map()
+      if (mode === 'all') {
+        for (const wt of worktrees) {
+          if (!wt.bare && !isUnborn(wt.head)) watched.set(wt.path, wt)
+        }
+        if (watched.size === 0) return { kind: 'error', text: 'No worktrees with commits to watch.' }
+      } else if (mode === 'worktree') {
+        const wt = resolveWorktree(worktrees, target, cwd)
+        if (!wt) {
+          const known = worktrees.map((w) => basename(w.path)).join(', ')
+          return { kind: 'error', text: `No worktree matches "${target}". Known worktrees: ${known}.` }
+        }
+        if (isUnborn(wt.head)) return { kind: 'error', text: `Worktree ${wt.path} has no commits yet.` }
+        watched.set(wt.path, wt)
+      } else {
+        // Default: strictly the worktree containing the session workspace.
+        const topLevel = await git(['rev-parse', '--show-toplevel'], cwd).then((out) => out.trim()).catch(() => '')
+        const wt = worktrees.find((entry) => entry.path === topLevel)
+        if (!wt || wt.bare) return { kind: 'error', text: `Current directory (${cwd}) is not a git worktree.` }
+        if (isUnborn(wt.head)) return { kind: 'error', text: `Worktree ${wt.path} has no commits yet.` }
+        watched.set(wt.path, wt)
+      }
+
       let busy = false
       const timer = setInterval(() => {
         if (busy) return
@@ -86,14 +130,22 @@ export function apply(ctx) {
 
       async function tick() {
         try {
-          const latest = (await git(['rev-parse', 'HEAD'], cwd)).trim()
-          if (latest === '' || latest === known) return
-          const previous = known
-          known = latest
-          // No whenIdle() gate: the next-turn inbox is the synchronization
-          // primitive — the splice is durable immediately and the turn runs
-          // once the agent reaches rest, whatever state it is in now.
-          agent.followup(createUserMessage(await renderNotification(cwd, previous, latest, prompt)))
+          for (const wt of parseWorktrees(await git(['worktree', 'list', '--porcelain'], cwd))) {
+            const previous = watched.get(wt.path)
+            if (!previous) {
+              // --all: worktrees registered after start are baselined at their
+              // current HEAD, so their pre-existing commits never fire a turn.
+              if (mode === 'all' && !wt.bare && !isUnborn(wt.head)) watched.set(wt.path, wt)
+              continue
+            }
+            if (wt.head === previous.head) continue
+            watched.set(wt.path, wt)
+            // One followup per changed worktree: each turn carries exactly one
+            // worktree's context. No whenIdle() gate: the next-turn inbox is
+            // the synchronization primitive — the turn runs when the agent
+            // reaches rest, whatever state it is in now.
+            agent.followup(createUserMessage(await renderNotification(wt, previous.head, wt.head, prompt)))
+          }
         } catch {
           // Transient git states (rebase, gc, packed-refs rewrite) are skipped
           // on the next tick; a workspace that vanished stops the listener.
@@ -111,9 +163,11 @@ export function apply(ctx) {
       }
 
       listeners.set(agent.id, stop)
+      const first = watched.values().next().value
+      const summary = [...watched.values()].map((wt) => `[${wt.branch}] ${basename(wt.path)}`).join(', ')
       return {
         kind: 'success',
-        text: `Listening for commits on [${branch}] from ${start.slice(0, 7)} (prompt: "${prompt}").`,
+        text: `Listening for commits (${mode}) on ${summary} from ${first.head.slice(0, 7)} (prompt: "${prompt}").`,
       }
     },
   })
@@ -129,24 +183,72 @@ function shortError(error) {
   return stderr || error?.message || String(error)
 }
 
-/** Build the full turn text for one observed HEAD movement. */
-export async function renderNotification(cwd, previous, latest, prompt) {
+/** Parse `git worktree list --porcelain`: blank-line separated blocks of
+ *  `key value` lines; `bare` and `detached` are valueless keys. Paths may
+ *  contain spaces, so only the first space splits key from value. */
+export function parseWorktrees(stdout) {
+  const worktrees = []
+  for (const block of stdout.split('\n\n')) {
+    const fields = new Map()
+    for (const line of block.split('\n')) {
+      if (!line) continue
+      const space = line.indexOf(' ')
+      const key = space === -1 ? line : line.slice(0, space)
+      const value = space === -1 ? true : line.slice(space + 1)
+      fields.set(key, value)
+    }
+    const path = fields.get('worktree')
+    if (typeof path !== 'string') continue
+    worktrees.push({
+      path,
+      head: fields.get('HEAD') ?? '',
+      branch: fields.has('branch') ? fields.get('branch').replace('refs/heads/', '') : '(detached)',
+      bare: fields.get('bare') === true,
+    })
+  }
+  return worktrees
+}
+
+/** True when a worktree's HEAD ref exists but points at no commit: the
+ *  all-zeros SHA of an unborn branch, or the HEAD-less bare shape. */
+function isUnborn(head) {
+  return !/[1-9a-f]/.test(head)
+}
+
+/** Match --worktree=<name|path> against the listing: resolved path first
+ *  (symlinks normalized, the way git prints them), then a unique basename —
+ *  the worktree's name. */
+function resolveWorktree(worktrees, target, cwd) {
+  let wanted = resolve(cwd, target)
+  try {
+    wanted = realpathSync(wanted)
+  } catch {
+    // Nonexistent path: keep the unresolved form; it matches nothing.
+  }
+  const byPath = worktrees.find((wt) => wt.path === wanted)
+  if (byPath) return byPath
+  const byName = worktrees.filter((wt) => basename(wt.path) === target)
+  return byName.length === 1 ? byName[0] : undefined
+}
+
+/** Build the full turn text for one observed HEAD movement in one worktree. */
+export async function renderNotification(wt, previous, latest, prompt) {
   // Snapshot diff base..latest: correct for fast-forward bursts, merges, and
   // history rewrites alike (no ~1 ancestry assumptions).
-  const [branch, subjects, stats, diff] = await Promise.all([
-    git(['rev-parse', '--abbrev-ref', 'HEAD'], cwd).catch(() => 'HEAD'),
-    git(['log', '--format=%h %s', `-n${MAX_COMMITS_LISTED}`, `${previous}..${latest}`], cwd).catch(() => ''),
-    git(['diff', '--stat', previous, latest], cwd).catch(() => ''),
-    git(['diff', previous, latest], cwd).catch(() => ''),
+  const [subjects, stats, diff] = await Promise.all([
+    git(['log', '--format=%h %s', `-n${MAX_COMMITS_LISTED}`, `${previous}..${latest}`], wt.path).catch(() => ''),
+    git(['diff', '--stat', previous, latest], wt.path).catch(() => ''),
+    git(['diff', previous, latest], wt.path).catch(() => ''),
   ])
   const listed = subjects.split('\n').map((line) => line.trim()).filter(Boolean)
   const header =
     listed.length > 0
-      ? `${listed.length} new commit${listed.length === 1 ? '' : 's'} on ${branch.trim()} (${previous.slice(0, 7)}..${latest.slice(0, 7)})`
-      : `HEAD moved ${previous.slice(0, 7)} -> ${latest.slice(0, 7)} on ${branch.trim()} (history rewritten or branch switched)`
+      ? `${listed.length} new commit${listed.length === 1 ? '' : 's'} on ${wt.branch} (${previous.slice(0, 7)}..${latest.slice(0, 7)})`
+      : `HEAD moved ${previous.slice(0, 7)} -> ${latest.slice(0, 7)} on ${wt.branch} (history rewritten or branch switched)`
 
   return [
     `[commit-listener] ${header}`,
+    `Worktree: ${wt.path}`,
     '',
     ...listed.map((subject) => `  ${subject}`),
     ...(listed.length >= MAX_COMMITS_LISTED ? [`  (list capped at ${MAX_COMMITS_LISTED} commits)`, ''] : []),
