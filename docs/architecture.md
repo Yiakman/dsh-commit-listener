@@ -275,6 +275,8 @@ inputTriggers.registerSource({
 - The candidates fetch hits the host's `/commit-listener/worktrees` Connection fetch route (`ctx.connection.fetch.register`, exact path, `requestBody: 'buffered'`); the session id resolves to a workspace through a host-side map filled from untagged `agent/created` dispatches.
 - These are undocumented internal seams (ModuleLoader wrapper protocol, source contract, route table) pinned to the shipped app build — a DSH update can break the picker independently of the host plugin; the submit-then-list discovery query remains the always-works fallback.
 
+The composer ghost hint is dynamic too: `commands.register()` returns an exact disposer, so the host half re-registers `/commit-listen` whenever the newest session's worktree-name set changes (on `agent/created` plus a 10 s unref'd poll), swapping the generic hint for `--worktree=<name|name|…>` (space-containing names skipped, long lists ellipsized). The hint is one global string — with two concurrent chats on different repos it follows the newest session; true per-agent hints exist via a command-injected child of `agent.ctx` if that ever matters.
+
 ### The Three Deterministic Disposal Paths
 
 Active listeners are tracked in an internal map (`Map<string, () => void>`) keyed by agent ID. Cleanup is triggered deterministically via three separate paths:

@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 
 const exec = promisify(execFile)
-const { apply, POLL_MS, parseWorktrees } = await import('./lib/index.js')
+const { apply, POLL_MS, parseWorktrees, hintFor } = await import('./lib/index.js')
 
 const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' }
 const IDENTITY = ['-c', 'user.name=tester', '-c', 'user.email=tester@example.com']
@@ -51,6 +51,16 @@ function mockAgent(cwd) {
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+// --- hintFor: ghost hint carries real worktree names --------------------------
+{
+  const GENERIC = '[--all | --worktree[=<name|path>]] <prompt> | off'
+  assert.equal(hintFor(['repo']), GENERIC, 'single worktree keeps the generic hint')
+  assert.equal(hintFor(['repo', 'feat-x']), '[--all | --worktree=<repo|feat-x>] <prompt> | off')
+  assert.ok(!hintFor(['has space', 'b', 'c']).includes('has space'), 'space-containing names are skipped')
+  const long = hintFor(Array.from({ length: 8 }, (_, i) => `worktree-number-${i}-with-a-long-name`))
+  assert.ok(long.length <= 140 && long.includes('…'), 'long lists truncate with an ellipsis')
+}
 
 // --- parseWorktrees: porcelain fixture (spaces, detached, bare, unborn) ------
 {
@@ -181,6 +191,16 @@ assert.equal(result.kind, 'error', 'off again errors: nothing active')
 // --- worktrees: default scope ignores a linked worktree ----------------------
 const featDir = join(root, 'feat-x')
 await git(repo, 'worktree', 'add', '-q', '-b', 'feature-x', featDir)
+
+// ghost hint: a known session with 2+ worktrees re-registers with real names
+ctx.listeners.find(({ event }) => event === 'agent/created').callback({ agent })
+await sleep(400)
+assert.ok(ctx.registered.length >= 2, 'hint refresh re-registered the command')
+const hinted = ctx.registered[ctx.registered.length - 1]
+assert.match(hinted.input.hint, /--worktree=<repo\|feat-x>/, 'hint lists the real worktree names')
+ctx.listeners.find(({ event }) => event === 'agent/created').callback({ agent })
+await sleep(400)
+assert.equal(ctx.registered.length, 2, 'unchanged worktree set does not re-register')
 
 result = await invoke('') // fresh listener, default: current worktree only
 assert.equal(result.kind, 'success')

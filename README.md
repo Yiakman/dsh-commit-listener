@@ -56,6 +56,10 @@ The patch layer hot-reloads on long-lived surfaces (`patchReload: "live"`); othe
   menu lists the repository's worktrees (branch · path, session worktree
   marked); Tab/Enter inserts the name inline. Worktree data comes from the
   host's `/commit-listener/worktrees` fetch route, resolved per session.
+- **Live ghost hint**: when the session workspace has more than one worktree,
+  the composer hint re-registers with the real names — `--worktree=<repo|feat-x>`
+  — so they are visible (and copyable) while typing; refreshed on session open
+  and every 10 s. A single worktree keeps the generic form.
 - Stops on `/commit-listen off`, on session close (`agent/disposed`), and on plugin
   unload/HMR (`ctx.effect` disposer).
 - Commands never consume model context: results render in the UI only, while
