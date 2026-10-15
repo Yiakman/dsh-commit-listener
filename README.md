@@ -8,9 +8,13 @@ Worktree-aware by default: `--all` watches every registered worktree,
 
 ## Files
 
-- `commit-listener.js` — the plugin (plain ESM, zero dependencies, no build step)
-- `test-commit-listener.mjs` — self-check against a real temp git repo (`node test-commit-listener.mjs`)
-- `cordis.patch.yml` — the patch-list overlay that loads the plugin
+```
+package.json               dual-face manifest (dsh.client → lib/client.js)
+lib/index.js               host plugin: /commit-listen + worktree fetch route
+lib/client.js              browser half: composer worktree picker
+test-commit-listener.mjs   self-check against a real temp git repo (node test-commit-listener.mjs)
+cordis.patch.yml           the patch-list overlay that loads the plugin
+```
 
 ## Install (DSH Desktop)
 
@@ -30,6 +34,7 @@ The patch layer hot-reloads on long-lived surfaces (`patchReload: "live"`); othe
 /commit-listen Focus on security risks        # session worktree, custom prompt
 /commit-listen --all                          # every registered worktree
 /commit-listen --worktree                     # list available worktrees
+/commit-listen --worktree=/                   # typing-time picker: menu completes a worktree name
 /commit-listen --worktree=feat-x              # one worktree, by name or path
 /commit-listen off                            # stop watching
 ```
@@ -46,6 +51,11 @@ The patch layer hot-reloads on long-lived surfaces (`patchReload: "live"`); othe
   `--worktree` is a read-only discovery query: it lists every registered
   worktree (branch, short HEAD, path, session marker) as a UI-only result and
   starts nothing — an active listener survives it.
+- **Typing-time picker**: the browser half registers a second source under the
+  composer's `/` trigger — type `--worktree=/` in the draft and the completion
+  menu lists the repository's worktrees (branch · path, session worktree
+  marked); Tab/Enter inserts the name inline. Worktree data comes from the
+  host's `/commit-listener/worktrees` fetch route, resolved per session.
 - Stops on `/commit-listen off`, on session close (`agent/disposed`), and on plugin
   unload/HMR (`ctx.effect` disposer).
 - Commands never consume model context: results render in the UI only, while

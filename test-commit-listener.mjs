@@ -1,5 +1,5 @@
-// Self-check for commit-listener.js: runs the real plugin against a real git
-// repo with a mock agent/context, at real poll intervals. Exit 0 = pass.
+// Self-check for the commit-listener plugin: runs the real plugin against a
+// real git repo with a mock agent/context, at real poll intervals. Exit 0 = pass.
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 
 const exec = promisify(execFile)
-const { apply, POLL_MS, parseWorktrees } = await import('./commit-listener.js')
+const { apply, POLL_MS, parseWorktrees } = await import('./lib/index.js')
 
 const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' }
 const IDENTITY = ['-c', 'user.name=tester', '-c', 'user.email=tester@example.com']
@@ -25,8 +25,10 @@ function commitFile(cwd, name, content, message) {
 function mockContext() {
   const registered = []
   const listeners = []
+  const routes = []
   return {
     commands: { register: (definition) => (registered.push(definition), () => {}) },
+    connection: { fetch: { register: (route) => routes.push(route) } },
     effect: (execute) => {
       const dispose = execute()
       return () => dispose?.()
@@ -34,6 +36,7 @@ function mockContext() {
     on: (event, callback) => (listeners.push({ event, callback }), () => {}),
     registered,
     listeners,
+    routes,
   }
 }
 
@@ -269,6 +272,32 @@ assert.equal(agent.followups.length, 8, 'listener survived the discovery query')
 await commitFile(featDir, 'w4.txt', 'w4\n', 'feat: worktree commit 4')
 await sleep(POLL_MS + 1500)
 assert.equal(agent.followups.length, 8, 'discovery neither replaced nor widened the listener')
+
+// --- browser picker route: /api/commit-listener/worktrees ------------------------
+const route = ctx.routes.find((entry) => entry.path === '/api/commit-listener/worktrees')
+assert.ok(route, 'worktree fetch route registered')
+
+const routeResponse = await route.fetch(new Request(`http://localhost/api/commit-listener/worktrees?cwd=${encodeURIComponent(repo)}`))
+assert.equal(routeResponse.status, 200)
+const routeData = await routeResponse.json()
+assert.equal(routeData.worktrees.length, 2)
+const mainRow = routeData.worktrees.find((wt) => wt.name === 'repo')
+assert.equal(mainRow.branch, 'main')
+assert.equal(mainRow.session, true, 'session worktree tagged for the picker')
+assert.deepEqual(mainRow.markers, [])
+const featRow = routeData.worktrees.find((wt) => wt.name === 'feat-x')
+assert.equal(featRow.branch, 'feature-x')
+assert.equal(featRow.session, false)
+
+// non-git cwd and unknown session both settle as 400 JSON errors
+assert.equal((await route.fetch(new Request(`http://localhost/api/commit-listener/worktrees?cwd=${encodeURIComponent(plain)}`))).status, 400)
+assert.equal((await route.fetch(new Request('http://localhost/api/commit-listener/worktrees?session=nope'))).status, 400)
+
+// session-scoped: the host resolves ?session= through the tracked agent map
+ctx.listeners.find(({ event }) => event === 'agent/created').callback({ agent })
+const sessionResponse = await route.fetch(new Request('http://localhost/api/commit-listener/worktrees?session=test-session'))
+assert.equal(sessionResponse.status, 200)
+assert.equal((await sessionResponse.json()).worktrees.length, 2)
 
 rmSync(root, { recursive: true, force: true })
 console.log('commit-listener self-check: all assertions passed')

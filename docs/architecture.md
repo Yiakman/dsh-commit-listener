@@ -259,6 +259,22 @@ Scoping modes derived from that listing:
 
 Each changed worktree produces exactly one `followup()`, so every agent turn carries a single worktree's `Worktree:` path and branch — the agent learns not just *what* changed but *where*. Flags are parsed as whole tokens, so a prompt may legitimately contain the text `--all`. A bare or valueless `--worktree` is a discovery query: the handler settles with `{kind: 'error'}` carrying the listing (the command runtime accepts only `success` and `error`, and `success` would wrongly imply a listener started); the result renders UI-only at zero tokens, and because discovery precedes restart disposal, an active listener keeps running. The same listing accompanies the no-match/ambiguous `--worktree=<target>` error.
 
+### Composer Picker (Browser Half)
+
+The plugin is a dual-face package: `package.json` declares `dsh.client`, so `dsh-client-modules` serves `lib/client.js` to the browser next to the host half (file-loaded plugins resolve their package root through `nearestPackage`). The browser half registers a second source under the composer's `/` trigger — trigger characters are hardcoded to `/` and `@` in `detectTrigger`, so `/` is the only ride-along:
+
+```js
+inputTriggers.registerSource({
+  trigger: '/', name: 'commit-listener-worktrees',
+  async candidates(session, { query, signal }) { /* fetch /commit-listener/worktrees?session=… , filter */ },
+  onPick: ({ candidate }) => ({ text: candidate.name }),  // → slash/input-insert-text at the span
+})
+```
+
+- Typing `--worktree=/` opens the grouped menu (the `/` after `=` passes the word-boundary rule); a pick replaces the `/query` span with the worktree's basename.
+- The candidates fetch hits the host's `/commit-listener/worktrees` Connection fetch route (`ctx.connection.fetch.register`, exact path, `requestBody: 'buffered'`); the session id resolves to a workspace through a host-side map filled from untagged `agent/created` dispatches.
+- These are undocumented internal seams (ModuleLoader wrapper protocol, source contract, route table) pinned to the shipped app build — a DSH update can break the picker independently of the host plugin; the submit-then-list discovery query remains the always-works fallback.
+
 ### The Three Deterministic Disposal Paths
 
 Active listeners are tracked in an internal map (`Map<string, () => void>`) keyed by agent ID. Cleanup is triggered deterministically via three separate paths:
