@@ -23,13 +23,13 @@ sequenceDiagram
     UI->>Cmd: Execute slash command
     Cmd->>Log: Append command/run & command/done (log-only)
     Cmd->>Plugin: Invoke handler({ agent, rawInput })
-    Plugin->>Git: git rev-parse HEAD (baseline check)
+    Plugin->>Git: git worktree list --porcelain (baseline check)
     Plugin-->>Cmd: Return { kind: 'success', text } (UI only)
     Cmd-->>UI: Display status message (0 LLM tokens)
 
     loop Every 2.5s (POLL_MS)
-        Plugin->>Git: git rev-parse HEAD
-        alt HEAD changed (previous != latest)
+        Plugin->>Git: git worktree list --porcelain
+        alt A watched worktree's HEAD changed
             Plugin->>Git: Gather log, diffstat, unified diff
             Plugin->>Plugin: Render notification + append prompt guardrail
             Plugin->>Loop: agent.followup(userMessage)
@@ -42,7 +42,7 @@ sequenceDiagram
 
 ### Core Responsibilities
 1. **Zero-token administrative control**: Configuration and toggling via `/commit-listen` run entirely in host memory and write log markers without consuming prompt tokens.
-2. **Decoupled polling and coalescing**: Regular polling of `git rev-parse HEAD` coalesces rapid commit bursts into a single batch analysis.
+2. **Decoupled polling and coalescing**: One `git worktree list --porcelain` poll per tick coalesces rapid commit bursts into a single batch analysis per changed worktree.
 3. **Turn-based agent dispatch**: Dispatches git diffs through `agent.followup()`, respecting turn boundaries and KV cache prefix stability.
 4. **Deterministic lifecycle cleanup**: Guarantees zero timer leaks across command toggles, session closures, and plugin hot-reloads.
 
@@ -95,7 +95,7 @@ Slash commands are managed by `@deepseek-ai/dsh-commands` through the `commands`
 ctx.commands.register({
   name: 'commit-listen',             // Validated against /^[a-z][a-z0-9_-]*$/
   description: '…',                  // Discovery metadata shown in the command palette
-  input: { hint: '<prompt> | off' }, // Ghost hint displayed in the user composer
+  input: { hint: '[--all | --worktree=<name|path>] <prompt> | off' }, // Ghost hint displayed in the user composer
   handler: async ({ agent, rawInput, signal }) => ({ kind: 'success' | 'error', text }),
 })
 ```
@@ -186,7 +186,7 @@ Session Log (Append-Only JSONL)
 | Strategy | Detection Latency | Idle Overhead | Failure Modes & Complexity |
 | :--- | :--- | :--- | :--- |
 | **Filesystem Watcher** (`.git/refs`) | < 50 ms | Near zero | Brittle: fails on `packed-refs`, worktrees, submodules, and branch switches. |
-| **Active Polling** (`git rev-parse HEAD`) | $\le$ interval (2.5 s) | 1 subprocess / 2.5 s | **Selected**: Resilient to index locks, rebases, and non-standard git structures. |
+| **Active Polling** (`git worktree list --porcelain`) | $\le$ interval (2.5 s) | 1 subprocess / 2.5 s | **Selected**: One call returns every worktree's path, HEAD and branch; resilient to index locks, rebases, packed-refs rewrites and non-standard git structures. |
 | **Git Hooks** (`post-commit`) | < 10 ms | Zero | Intrusive: modifies user repo configuration, difficult to manage across projects. |
 | **Remote Polling** (`git ls-remote`) | 10–60 s | High (Network I/O) | Inapplicable for unpushed local development commits. |
 
@@ -194,7 +194,7 @@ Session Log (Append-Only JSONL)
 
 Rather than maintaining custom debounce timers, the 2.5-second polling interval serves as a natural coalescing boundary:
 - Rapid sequences of commits (e.g., automated scripts or quick saves) landing within the interval are aggregated into a single tick.
-- The notification compares the last known commit against the new HEAD (`previous..latest`), generating one comprehensive update.
+- Each watched worktree's notification compares its last known commit against its new HEAD (`previous..latest`), generating one comprehensive update per changed worktree.
 
 ### Snapshot Diff Semantics
 
@@ -202,6 +202,7 @@ The plugin uses explicit snapshot ranges (`git diff previous latest` and `git lo
 - **Merge & Rebase Safe**: Handles non-linear history, branch switches, and squashes cleanly.
 - **Root Commit Safe**: Avoids failures when reviewing initial repository commits where `HEAD~1` does not exist.
 - **Rewritten History Fallback**: If `previous..latest` yields no commits (e.g., after `git reset` or branch switching), the plugin detects the movement and reports the state shift with a direct diff.
+- **Worktree-Local Execution**: Every diff/log command runs with `cwd` bound to the changed worktree's root, so path resolution matches that worktree natively — no `--work-tree`/`--git-dir` plumbing needed.
 
 ### Bounds & Prompt Injection Guardrails
 
@@ -223,6 +224,58 @@ To prevent context exhaustion and prompt hijacking:
 The target git directory is always resolved from `agent.session.header.cwd`, falling back to `process.cwd()` only if undefined:
 - In multi-window or multi-tab environments, each chat session binds to its own project folder.
 - Separate sessions can independently monitor different git repositories without collision.
+
+### Worktree Anatomy: One Object Database, Many HEADs
+
+Git worktrees share the primary `.git/` object database and remote-tracking metadata, but keep isolated working state:
+
+- **Per-worktree `HEAD`**: the main worktree's pointer lives in `.git/HEAD`; each linked worktree's pointer lives in `.git/worktrees/<name>/HEAD`. A commit made in a linked worktree never moves the main worktree's `HEAD`, and vice versa.
+- **Per-worktree index and private refs**: each worktree stages independently (`refs/worktree/…`), while public branches (`refs/heads/*`) are shared.
+
+Two consequences shape the design:
+- Watching `.git/HEAD` (or `rev-parse HEAD` in a fixed directory) sees only that one worktree — which is exactly the desired *default* isolation.
+- A blind `git log` over the shared branch refs sees commits from every worktree but loses the *where* — no directory context.
+
+Both problems resolve with a single `git worktree list --porcelain` per tick:
+
+```text
+worktree /Users/dev/project
+HEAD a1b2c3d4e5f6…
+branch refs/heads/main
+
+worktree /Users/dev/project-feat
+HEAD 9f8e7d6c5b4a…
+branch refs/heads/feature-x
+```
+
+Scoping modes derived from that listing:
+
+| Invocation | Watched set |
+| :--- | :--- |
+| `/commit-listen` | The worktree containing the session workspace — `rev-parse --show-toplevel` matched against the listing. |
+| `/commit-listen --all` | Every registered worktree; `bare` and unborn (all-zero `HEAD`) entries skipped, worktrees registered after start baselined silently at their current HEAD. |
+| `/commit-listen --worktree=<name\|path>` | One worktree: resolved-path match first (symlinks normalized the way git prints them), then a unique basename — the worktree's name. |
+| `/commit-listen --worktree` (bare or empty value) | None — a read-only, UI-only listing of every registered worktree (branch, short HEAD, path, markers, session tag). |
+
+Each changed worktree produces exactly one `followup()`, so every agent turn carries a single worktree's `Worktree:` path and branch — the agent learns not just *what* changed but *where*. Flags are parsed as whole tokens, so a prompt may legitimately contain the text `--all`. A bare or valueless `--worktree` is a discovery query: the handler settles with `{kind: 'error'}` carrying the listing (the command runtime accepts only `success` and `error`, and `success` would wrongly imply a listener started); the result renders UI-only at zero tokens, and because discovery precedes restart disposal, an active listener keeps running. The same listing accompanies the no-match/ambiguous `--worktree=<target>` error.
+
+### Composer Picker (Browser Half)
+
+The plugin is a dual-face package: `package.json` declares `dsh.client`, so `dsh-client-modules` serves `lib/client.js` to the browser next to the host half (file-loaded plugins resolve their package root through `nearestPackage`). The browser half registers a second source under the composer's `/` trigger — trigger characters are hardcoded to `/` and `@` in `detectTrigger`, so `/` is the only ride-along:
+
+```js
+inputTriggers.registerSource({
+  trigger: '/', name: 'commit-listener-worktrees',
+  async candidates(session, { query, signal }) { /* fetch /commit-listener/worktrees?session=… , filter */ },
+  onPick: ({ candidate }) => ({ text: candidate.name }),  // → slash/input-insert-text at the span
+})
+```
+
+- Typing `--worktree=/` opens the grouped menu (the `/` after `=` passes the word-boundary rule); a pick replaces the `/query` span with the worktree's basename.
+- The candidates fetch hits the host's `/commit-listener/worktrees` Connection fetch route (`ctx.connection.fetch.register`, exact path, `requestBody: 'buffered'`); the session id resolves to a workspace through a host-side map filled from untagged `agent/created` dispatches.
+- These are undocumented internal seams (ModuleLoader wrapper protocol, source contract, route table) pinned to the shipped app build — a DSH update can break the picker independently of the host plugin; the submit-then-list discovery query remains the always-works fallback.
+
+The composer ghost hint is dynamic too: `commands.register()` returns an exact disposer, so the host half re-registers `/commit-listen` whenever the newest session's worktree-name set changes (on `agent/created` plus a 10 s unref'd poll), swapping the generic hint for `--worktree=<name|name|…>` (space-containing names skipped, long lists ellipsized). The hint is one global string — with two concurrent chats on different repos it follows the newest session; true per-agent hints exist via a command-injected child of `agent.ctx` if that ever matters.
 
 ### The Three Deterministic Disposal Paths
 
@@ -251,9 +304,9 @@ graph TD
 
 ---
 
-## 7. Deviations from the Original Reference Design
+## 7. Deviations from the Reference Designs
 
-The initial reference specification outlined the integration concept, but required several architectural adjustments to achieve production reliability:
+The reference specifications (the initial draft and the 2026 worktree expansion) outlined the integration concept, but required several architectural adjustments to achieve production reliability. The worktree draft alone re-introduced five previously fixed regressions (`process.cwd()` rooting, a `whenIdle()` gate, the deprecated `{kind: 'plugin'}` source, `hash~1` diffs, and a missing injection guardrail) while adding three new ones:
 
 | Feature / Area | Original Reference Draft | Production Plugin Implementation | Engineering Rationale |
 | :--- | :--- | :--- | :--- |
@@ -264,6 +317,9 @@ The initial reference specification outlined the integration concept, but requir
 | **Diff Resolution** | `git diff hash~1 hash` | Snapshot range: `git diff previous latest` | Correctly handles multi-commit bursts, merges, history rebases, and root commits. |
 | **Debounce Handling** | Dedicated debounce timers | Polling interval coalescing | Polling inherently batches changes between ticks; redundant timers add complexity without benefit. |
 | **Session Cleanup** | Leaked timer on tab close | `agent/disposed` event listener | Prevents dangling background timers and resource leaks when sessions terminate. |
-| **Git Pre-flight Check** | `fs.existsSync('.git')` | Let `git rev-parse HEAD` validate | Supports git worktrees, submodules, and bare repositories where `.git` is a file, not a directory. |
+| **Git Pre-flight Check** | `fs.existsSync('.git')` | Let `git worktree list --porcelain` validate | Supports git worktrees, submodules, and bare repositories where `.git` is a file, not a directory. |
 | **Prompt Security** | Raw untrusted diff output | Wrapped diff + prompt isolation instruction | Mitigates prompt injection attacks originating from commit logs or modified files. |
+| **Worktree Discovery** | `.git/HEAD` monitoring or blind `git log` over shared refs | `git worktree list --porcelain` once per tick | `.git/HEAD` sees only the main worktree; shared-ref logs lose the directory context; porcelain returns paths, HEADs and branches in one subprocess. |
+| **Worktree Baselines** | Fixed `lastSeenHeads` snapshot captured at start | `--all` baselines late-registered worktrees; skips `bare` and unborn entries | A newly registered worktree's pre-existing HEAD must not fire a turn; unborn (all-zero) HEADs would render empty diffs. |
+| **Flag Parsing** | Substring match (`input.includes('--all')`) | Whole-token parsing | A prompt may legitimately contain the text `--all`. |
 

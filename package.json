@@ -1,0 +1,19 @@
+{
+  "name": "dsh-commit-listener",
+  "version": "0.3.0",
+  "description": "Worktree-aware /commit-listen: hands each new git commit to the agent as a formal turn; ships a composer worktree picker",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    "./client": "./lib/client.js"
+  },
+  "private": true,
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-input-trigger"
+      ],
+      "platform": "web"
+    }
+  }
+}

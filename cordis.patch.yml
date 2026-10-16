@@ -3,4 +3,4 @@
 # (or paste the insert entry into the profile's user patch layer)
 - insert:
     - id: commit-listener
-      name: /Users/eduardosoto/Code/dsh-commit-listener/commit-listener.js
+      name: /Users/eduardosoto/Code/dsh-commit-listener/lib/index.js
