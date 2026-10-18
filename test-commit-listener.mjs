@@ -26,7 +26,7 @@ function mockContext() {
   const registered = []
   const listeners = []
   const routes = []
-  return {
+  const ctx = {
     commands: { register: (definition) => (registered.push(definition), () => {}) },
     connection: { fetch: { register: (route) => routes.push(route) } },
     effect: (execute) => {
@@ -34,10 +34,14 @@ function mockContext() {
       return () => dispose?.()
     },
     on: (event, callback) => (listeners.push({ event, callback }), () => {}),
+    // Nested soft dependency: cordis starts the callback once the service is
+    // there and never otherwise; the mock mirrors exactly that.
+    inject: (deps, callback) => (deps.every((dep) => ctx[dep]) ? callback(ctx) : undefined),
     registered,
     listeners,
     routes,
   }
+  return ctx
 }
 
 function mockAgent(cwd) {
@@ -102,6 +106,13 @@ await commitFile(repo, 'README.md', 'hello\n', 'initial commit')
 const ctx = mockContext()
 apply(ctx)
 const command = ctx.registered[0]
+
+// --- TUI shape: no Connection service → command registers, route does not ---
+const tui = mockContext()
+delete tui.connection
+apply(tui)
+assert.equal(tui.registered[0].name, 'commit-listen')
+assert.equal(tui.routes.length, 0)
 
 // --- definition shape (mirrors dsh-commands normalizeDefinition rules) -------
 assert.equal(command.name, 'commit-listen')
