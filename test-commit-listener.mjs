@@ -214,7 +214,7 @@ result = await invoke('--set-picker=maybe')
 assert.equal(result.kind, 'error')
 assert.match(result.text, /accepts "on" or "off"/)
 
-// --- worktrees: default scope ignores a linked worktree -----------------------
+// --- worktrees: linked worktree joins the repo -------------------------------
 const featDir = join(root, 'feat-x')
 await git(repo, 'worktree', 'add', '-q', '-b', 'feature-x', featDir)
 
@@ -228,22 +228,48 @@ ctx.listeners.find(({ event }) => event === 'agent/created').callback({ agent })
 await sleep(400)
 assert.equal(ctx.registered.length, 2, 'unchanged worktree set does not re-register')
 
-result = await invoke('') // default listener: current worktree only
-assert.equal(result.kind, 'success')
-assert.match(result.text, /\(current\)/)
-assert.match(result.text, /main/)
+// --- interactive picker: bare invocation in a multi-worktree repo asks --------
+const pickRoute = ctx.routes.find((entry) => entry.path === '/api/commit-listener/pick')
+assert.ok(pickRoute, 'pick fetch route registered')
 
+result = await invoke('')
+assert.equal(result.kind, 'error', 'bare invocation asks instead of silently starting')
+assert.match(result.text, /Multiple worktrees/)
+assert.match(result.text, /Available worktrees \(--worktree=<name\|path>\):/)
+
+let pickResponse = await pickRoute.fetch(new Request('http://localhost/api/commit-listener/pick?session=test-session'))
+assert.equal(pickResponse.status, 200)
+let pickData = await pickResponse.json()
+assert.equal(pickData.pending.worktrees.length, 2, 'only watchable worktrees offered')
+assert.ok(pickData.pending.worktrees.every((wt) => wt.name === 'repo' || wt.name === 'feat-x'))
+assert.equal(pickData.pending.worktrees.find((wt) => wt.name === 'repo').session, true, 'session worktree flagged')
+assert.equal(pickData.pending.worktrees.find((wt) => wt.name === 'feat-x').session, false)
+
+pickResponse = await pickRoute.fetch(
+  new Request('http://localhost/api/commit-listener/pick?session=test-session', {
+    method: 'POST',
+    body: JSON.stringify({ target: 'feat-x' }),
+  }),
+)
+assert.equal(pickResponse.status, 200)
+const startResult = await pickResponse.json()
+assert.equal(startResult.kind, 'success', 'picking starts the listener')
+assert.match(startResult.text, /\(worktree\)/)
+assert.match(startResult.text, /feature-x/)
+
+pickResponse = await pickRoute.fetch(new Request('http://localhost/api/commit-listener/pick?session=test-session'))
+assert.equal((await pickResponse.json()).pending, null, 'no pending state left after the pick')
+
+// the route-started listener fires on the picked worktree only
 await commitFile(featDir, 'w1.txt', 'w1\n', 'feat: worktree commit 1')
 await sleep(POLL_MS + 1500)
-assert.equal(agent.followups.length, 3, 'linked-worktree commit is invisible by default')
+assert.equal(agent.followups.length, 4)
+assert.match(agent.followups[3].content[0].text, /feat: worktree commit 1/)
+assert.match(agent.followups[3].content[0].text, /on feature-x/)
 
 await commitFile(repo, 'm1.txt', 'm1\n', 'main commit 1')
 await sleep(POLL_MS + 1500)
-assert.equal(agent.followups.length, 4)
-const mainText = agent.followups[3].content[0].text
-assert.match(mainText, /main commit 1/)
-assert.match(mainText, /on main/)
-assert.match(mainText, /Worktree: .*\/repo\n/, 'notification carries the worktree path')
+assert.equal(agent.followups.length, 4, 'unpicked sibling stays invisible')
 
 // --- --all: one followup per changed worktree, flags stripped from prompt ----
 result = await invoke('--all Watch both worktrees')
@@ -309,6 +335,24 @@ await commitFile(featDir, 'w4.txt', 'w4\n', 'feat: worktree commit 4')
 await sleep(POLL_MS + 1500)
 assert.equal(agent.followups.length, 8, 'discovery neither replaced nor widened the listener')
 
+// --- dismiss: the × clears a pending pick without starting anything ----------
+result = await invoke('')
+assert.equal(result.kind, 'error')
+pickResponse = await pickRoute.fetch(new Request('http://localhost/api/commit-listener/pick?session=test-session'))
+assert.notEqual((await pickResponse.json()).pending, null, 'pending state exists while deciding')
+pickResponse = await pickRoute.fetch(
+  new Request('http://localhost/api/commit-listener/pick?session=test-session', { method: 'POST', body: '{}' }),
+)
+assert.equal((await pickResponse.json()).text, 'Selection dismissed; nothing started.')
+
+// 'off' clears a pending pick too
+result = await invoke('')
+assert.equal(result.kind, 'error')
+result = await invoke('off')
+assert.equal(result.kind, 'success')
+pickResponse = await pickRoute.fetch(new Request('http://localhost/api/commit-listener/pick?session=test-session'))
+assert.equal((await pickResponse.json()).pending, null)
+
 // --- setting picker:false — bare invocation proceeds with the session worktree
 const quietCtx = mockContext()
 apply(quietCtx, { picker: false })
@@ -368,7 +412,7 @@ const sessionResponse = await route.fetch(new Request('http://localhost/api/comm
 assert.equal(sessionResponse.status, 200)
 assert.equal((await sessionResponse.json()).worktrees.length, 2)
 
-// --- browser half: module shape + trigger source smoke test ------------------
+// --- browser half: module shape + slot/trigger registration smoke test ------
 {
   const loaded = []
   const fakeWindow = { __ModuleLoader__: { load: (handoff) => loaded.push(handoff) } }
@@ -391,6 +435,8 @@ assert.equal((await sessionResponse.json()).worktrees.length, 2)
   assert.equal(typeof clientExports.apply, 'function')
 
   const registeredSources = []
+  const slotInjections = []
+  const slotRegistrations = []
   const clientCtx = {
     get: (name) =>
       name === 'inputTriggers' ? { registerSource: (source) => (registeredSources.push(source), noop()) } : undefined,
@@ -399,10 +445,30 @@ assert.equal((await sessionResponse.json()).worktrees.length, 2)
       return () => dispose?.()
     },
     inject: (deps, callback) => (deps.every((dep) => clientCtx[dep]) ? callback(clientCtx) : undefined),
+    slots: {
+      inject: (key, callback) => {
+        slotInjections.push(key)
+        return callback() ?? noop()
+      },
+      register: (options, component) => {
+        slotRegistrations.push({ options, component })
+        return noop()
+      },
+    },
   }
   clientExports.apply(clientCtx)
   assert.equal(registeredSources[0].name, 'commit-listener-worktrees', 'typing-time source registered')
   assert.equal(registeredSources[0].trigger, '/')
+  assert.deepEqual(slotInjections, ['conversation.input.dock'], 'picker panel targets the input dock')
+  assert.equal(slotRegistrations[0].options.id, 'commit-listener-picker')
+  assert.equal(typeof slotRegistrations[0].component, 'function')
+
+  // Panel render smoke: nothing without a session or a pending pick. (With a
+  // pending pick the hooks-based flow needs a real renderer; the host-side
+  // route tests above cover the data contract it renders.)
+  const Picker = slotRegistrations[0].component
+  assert.equal(Picker({}), null, 'no session → nothing rendered')
+  assert.equal(Picker({ session: { sessionId: 's1' } }), null, 'no pending pick → nothing rendered')
 }
 
 rmSync(root, { recursive: true, force: true })
