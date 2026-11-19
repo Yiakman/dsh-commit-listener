@@ -1,6 +1,6 @@
 # Architecture Notes — commit-listener plugin
 
-Design rationale and runtime architecture for [`commit-listener.js`](file:///Users/eduardosoto/Code/dsh-commit-listener/commit-listener.js), verified against the DeepSeek Harness (DSH) sources shipped in the desktop bundle (`@deepseek-ai/*` 0.1.5-rc.2, Cordis 4.0.2).
+Design rationale and runtime architecture for [`lib/index.js`](file:///Users/eduardosoto/Code/dsh-commit-listener/lib/index.js) + [`lib/client.js`](file:///Users/eduardosoto/Code/dsh-commit-listener/lib/client.js), verified against the DeepSeek Harness (DSH) sources shipped in the desktop bundle (`@deepseek-ai/*` 0.2.2-rc.3, Cordis 4.1).
 
 ---
 
@@ -252,7 +252,9 @@ Scoping modes derived from that listing:
 
 | Invocation | Watched set |
 | :--- | :--- |
-| `/commit-listen` | The worktree containing the session workspace — `rev-parse --show-toplevel` matched against the listing. |
+| `/commit-listen` (one watchable worktree) | The worktree containing the session workspace — `rev-parse --show-toplevel` matched against the listing. |
+| `/commit-listen` (several watchable worktrees, picker **on**) | None yet — a pending pick is parked and the clickable panel asks; the choice (a worktree or `--all`) starts the listener through the pick route. |
+| `/commit-listen` (several watchable worktrees, picker **off**) | The session worktree, without asking (`picker: false` in plugin config). |
 | `/commit-listen --all` | Every registered worktree; `bare` and unborn (all-zero `HEAD`) entries skipped, worktrees registered after start baselined silently at their current HEAD. |
 | `/commit-listen --worktree=<name\|path>` | One worktree: resolved-path match first (symlinks normalized the way git prints them), then a unique basename — the worktree's name. |
 | `/commit-listen --worktree` (bare or empty value) | None — a read-only, UI-only listing of every registered worktree (branch, short HEAD, path, markers, session tag). |
@@ -276,6 +278,24 @@ inputTriggers.registerSource({
 - These are undocumented internal seams (ModuleLoader wrapper protocol, source contract, route table) pinned to the shipped app build — a DSH update can break the picker independently of the host plugin; the submit-then-list discovery query remains the always-works fallback.
 
 The composer ghost hint is dynamic too: `commands.register()` returns an exact disposer, so the host half re-registers `/commit-listen` whenever the newest session's worktree-name set changes (on `agent/created` plus a 10 s unref'd poll), swapping the generic hint for `--worktree=<name|name|…>` (space-containing names skipped, long lists ellipsized). The hint is one global string — with two concurrent chats on different repos it follows the newest session; true per-agent hints exist via a command-injected child of `agent.ctx` if that ever matters.
+
+### Interactive Worktree Picker (bare invocation)
+
+A command handler cannot block on user input (`{kind, text}` is its whole contract), so the picker is an asynchronous handshake across the plugin's two halves:
+
+1. A bare `/commit-listen` in a repository with **more than one watchable** (non-bare, born) worktree parks a *pending pick* (`Map<agentId, {cwd, prompt, worktrees}>`) and settles with `{kind: 'error'}` carrying the discovery listing — the same zero-token, UI-only result discovery uses, because `success` would wrongly imply a listener started. The listing doubles as the TUI fallback: where no panel can render, it tells the user to re-run with `--worktree=<name|path>`.
+2. The browser half renders the pending state as one full-width panel above the composer — the `conversation.input.dock` slot (`kind: 'list'`, `scope: 'session'`, owner props `{ session: SessionSnapshot, input }`), registered through `ctx.slots.inject` + `ctx.slots.register`. One button per watchable worktree (session's tagged, branch shown), one **All worktrees** button, one × dismiss. The panel polls `GET /api/commit-listener/pick?session=…` every 2 s while mounted, so it appears the moment a command parks a pick and disappears when the state clears.
+3. A click `POST /api/commit-listener/pick` with `{session, target}` — a worktree name or the `__all__` sentinel (never a legal basename). The host **re-lists the worktrees at click time**, resolves the target through the same `resolveWorktree` path as the flag, and calls the shared `startListener()` — so a name that vanished between command and click errors instead of watching a stale target. The response `{kind, text}` renders in the panel for a few seconds; the pending state is consumed either way.
+4. The invocation's inline prompt rides the pending state, so `/commit-listen focus on security` + a click watches with *that* instruction. Pending picks are ephemeral plugin memory (never session events): replaced by the next invocation in the session, cleared by `off`, dismissal, a completed pick, `agent/disposed`, and plugin unload/HMR.
+
+### Settings Persistence (`--set-prompt`, `--set-picker`, `--config`)
+
+The plugin declares **no `Config` schema** (it stays dependency-free — only Node builtins), and Cordis passes a schema-less plugin its raw row config through unchanged, so `apply(ctx, config)` sanitizes on read: `picker !== false` and a non-empty trimmed `prompt` string. Writes go through the profile **config editor** (`ctx.fiber.entry` + `ctx.get('configEditor').edit(entry, fn)`), which validates via the same passthrough, serializes with other profile writes, and rewrites only this plugin's row in the user's patch layer — preserving comments, other rows, and `!!js` expressions. Consequences:
+
+- The settings survive restarts and remain hand-editable in the yml (`config: {prompt: …, picker: …}` on the plugin's row).
+- Editing an ordinary config field **hot-reloads the plugin**: `apply` re-runs with the new values, which stops every active listener (same as any HMR). The `--set-*` results say so when listeners were running.
+- Both set flags in one invocation coalesce into a single edit (a second `edit()` on a replaced entry would throw `Configuration entry is no longer available`), and `--config` reads back the sanitized state at zero cost.
+- Prompt precedence is `inline text > configured default > built-in DEFAULT_PROMPT`, evaluated per invocation.
 
 ### The Three Deterministic Disposal Paths
 
