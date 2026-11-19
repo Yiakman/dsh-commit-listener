@@ -1,7 +1,7 @@
 {
   "name": "dsh-commit-listener",
-  "version": "0.4.1",
-  "description": "Worktree-aware /commit-listen: hands each new git commit to the agent as a formal turn; asks which worktree to watch (clickable picker) and supports a saved default prompt",
+  "version": "0.5.0",
+  "description": "Worktree-aware /commit-listen: hands each new git commit to the agent as a formal turn; asks which worktree to watch (clickable picker), supports a saved default prompt, reports live status (--status) and re-arms listeners across settings reloads",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

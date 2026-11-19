@@ -294,10 +294,20 @@ A command handler cannot block on user input (`{kind, text}` is its whole contra
 The plugin declares **no `Config` schema** (it stays dependency-free — only Node builtins), and Cordis passes a schema-less plugin its raw row config through unchanged, so `apply(ctx, config)` sanitizes on read: `picker !== false` and a non-empty trimmed `prompt` string. Writes go through the profile **config editor** (`ctx.fiber.entry` + `ctx.get('configEditor').edit(entry, fn)`), which validates via the same passthrough, serializes with other profile writes, and rewrites only this plugin's row in the user's patch layer — preserving comments, other rows, and `!!js` expressions. Consequences:
 
 - The settings survive restarts and remain hand-editable in the yml (`config: {prompt: …, picker: …}` on the plugin's row).
-- Editing an ordinary config field **hot-reloads the plugin**: `apply` re-runs with the new values, which stops every active listener (same as any HMR). The `--set-*` results say so when listeners were running.
+- Editing an ordinary config field **hot-reloads the plugin's fiber**: `apply` re-runs with the new values *on the same cached module instance*, so the module-level handoff (see [Status & Restore](#status--restore)) re-arms every active listener automatically — resuming from the last seen commits, so nothing is missed during the reload gap and nothing already reported fires twice. The `--set-*` results point at `--status` when listeners were running. A true *file* change re-imports the module (the loader's URL-keyed cache invalidates), the handoff is lost and listeners stay stopped — re-run `/commit-listen` after editing plugin files.
 - Both set flags in one invocation coalesce into a single edit (a second `edit()` on a replaced entry would throw `Configuration entry is no longer available`), and `--config` reads back the sanitized state at zero cost.
 - Prompt precedence is `inline text > configured default > built-in DEFAULT_PROMPT`, evaluated per invocation.
 - **The insert row's `name` must be a `file://` URL.** dsh anchors inserted plain paths to `file://` URLs when parsing a patch file, but the config editor's own validation composes its document *without* anchoring — so with a plain-path row, the editor's config row (named with the live `file://` name) fails its name-mismatch guard and every save dies as `overridden by a home patch or command-line overlay`. With a URL-form name both sides match and saves validate (verified against the installed 0.2.2-rc.3 sources).
+
+### Status & Restore
+
+`--status`, the `listening` chip and the reload handoff (all zero-token: status and stop never create agent turns):
+
+- **Module-level handoff.** A top-level `const handoff = new Map()` (outside `apply`) parks `agentId → {agent, cwd, mode, target, prompt, promptSource, watched}` for every listener `startListener` creates. The `watched` snapshot (plain objects) is refreshed whenever a tick moves a head or baselines a late worktree, so it always sits at the last *reported* commit — restore fidelity is exact.
+- **Why module level — verified loader behavior.** A config-only update (a settings save) disposes the old fiber and re-runs `apply` with the new config **on the same cached module instance**: `@deepseek-ai/cordis-plugin-loader`'s module cache is URL-keyed and is only re-imported on real file changes. Apply-scope Maps (`listeners`, `agents`, `pendingPicks`) die with the fiber; top-level state survives the swap.
+- **The stop invariant — explicit vs. lifecycle.** Explicit stops express user intent ("stay off") and **delete** the handoff entry: `/commit-listen off`, the pick route's `__stop__` sentinel (the chip's ×), `agent/disposed`, and tick self-termination when the workspace vanished. The one **lifecycle** stop — the `ctx.effect` root disposer on plugin reload/unload — stops every timer but **preserves** the entries, so the next `apply` can re-arm them.
+- **The restore pass.** After registration, `apply` iterates the handoff fire-and-forget (it never blocks `apply`): each entry whose agent still has `session` re-seeds the apply-scope `agents` map — so the browser routes keep resolving existing sessions instead of 400ing until a new `agent/created` — and rebuilds the listener through the *same* `startListener`, passing `resumeWatched` to inject the saved baselines instead of re-deriving them (one code path, no duplicated tick/stop logic). Commits made during the reload gap report on the next tick rather than being silently rebaselined. Any failure (agent gone, repo unreadable, a throwing followup) drops the entry and continues; restore is idempotent because `startListener`'s restart semantics replace rather than duplicate.
+- **The file-HMR exception.** A real file change re-imports the module: the handoff is lost with the old instance and listeners stay stopped. That case remains "listeners stop" by design and is documented in the README.
 
 ### The Three Deterministic Disposal Paths
 
@@ -316,7 +326,7 @@ graph TD
 
 1. **User Action**: `/commit-listen off` retrieves and calls the session disposer.
 2. **Session Disposal**: The plugin registers an untagged `ctx.on('agent/disposed')` listener. When a session tab or agent is closed, its timer is cleared immediately.
-3. **Plugin Unload / HMR**: Cordis invokes the cleanup function registered with `ctx.effect()`, clearing all timers across all sessions.
+3. **Plugin Unload / HMR**: Cordis invokes the cleanup function registered with `ctx.effect()`, clearing all timers across all sessions. Since the status/restore work this path *preserves* each listener's module-level handoff entry, so a config-only reload (a settings save) re-arms them — see [Status & Restore](#status--restore). Paths 1–3 (and the chip's `__stop__`) all delete the handoff entry: they express explicit user or session intent to stay off.
 
 ### Fault Tolerance
 

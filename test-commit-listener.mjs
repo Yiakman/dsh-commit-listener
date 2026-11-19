@@ -26,11 +26,15 @@ function mockContext() {
   const registered = []
   const listeners = []
   const routes = []
+  const disposers = []
   const ctx = {
     commands: { register: (definition) => (registered.push(definition), () => {}) },
-    connection: { fetch: { register: (route) => routes.push(route) } },
+    connection: { fetch: { register: (route) => (routes.push(route), () => {}) } },
     effect: (execute) => {
       const dispose = execute()
+      // Cordis runs every effect disposer on fiber dispose; keeping them lets
+      // the restore tests simulate the settings-save reload exactly.
+      disposers.push(dispose)
       return () => dispose?.()
     },
     on: (event, callback) => (listeners.push({ event, callback }), () => {}),
@@ -40,14 +44,15 @@ function mockContext() {
     registered,
     listeners,
     routes,
+    disposers,
   }
   return ctx
 }
 
-function mockAgent(cwd) {
+function mockAgent(cwd, id = 'test-session') {
   const followups = []
   return {
-    id: 'test-session',
+    id,
     session: { header: { cwd } },
     followup: (message) => followups.push(message),
     followups,
@@ -592,6 +597,83 @@ assert.equal((await sessionResponse.json()).worktrees.length, 2)
   const Picker = slotRegistrations[0].component
   assert.equal(Picker({}), null, 'no session → nothing rendered')
   assert.equal(Picker({ session: { sessionId: 's1' } }), null, 'no pending pick → nothing rendered')
+}
+
+// --- restore: listeners re-arm across a settings-save reload -------------------
+// The suite imports the real module once, so module-level state (the handoff)
+// persists across apply() calls in this process — exactly like a config-only
+// fiber reload in DSH, where the loader reuses the cached module instance.
+{
+  const repo2 = join(root, 'restore')
+  mkdirSync(repo2)
+  await git(repo2, 'init', '-q', '-b', 'main')
+  await commitFile(repo2, 'base.txt', 'base\n', 'restore base')
+
+  // apply #1: start a listener and report one commit through it
+  const ctx1 = mockContext()
+  apply(ctx1)
+  const cmd1 = ctx1.registered[0]
+  const agent1 = mockAgent(repo2, 'restore-session')
+  result = await cmd1.handler({ agent: agent1, rawInput: '' })
+  assert.equal(result.kind, 'success')
+  await commitFile(repo2, 'pre.txt', 'pre\n', 'before reload')
+  await sleep(POLL_MS + 1500)
+  assert.equal(agent1.followups.length, 1, 'pre-reload commit reported')
+
+  // The fiber dispose a settings save triggers: timers stop (lifecycle stop),
+  // the module-level handoff survives.
+  for (const dispose of ctx1.disposers) dispose()
+  await commitFile(repo2, 'gap.txt', 'gap\n', 'during reload gap')
+  await sleep(POLL_MS + 1500)
+  assert.equal(agent1.followups.length, 1, 'disposed fiber reports nothing')
+
+  // apply #2 (same module, same agent): re-arm resumes from the SAVED baseline
+  // — the gap commit fires exactly one followup, nothing is rebaselined away
+  // and nothing already reported is reported twice.
+  const ctx2 = mockContext()
+  apply(ctx2)
+  const cmd2 = ctx2.registered[0]
+  await sleep(POLL_MS + 1500)
+  assert.equal(agent1.followups.length, 2, 'gap commit fires exactly one followup after restore')
+  const restoredText = agent1.followups[1].content[0].text
+  assert.match(restoredText, /during reload gap/)
+  assert.ok(!restoredText.includes('before reload'), 'already-reported commits are not re-reported')
+
+  // The restored listener is visible to --status, and the browser routes keep
+  // resolving the existing session (agents map re-seeded from the handoff).
+  result = await cmd2.handler({ agent: agent1, rawInput: '--status' })
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /Commit listener active for this session/)
+  assert.match(result.text, /mode: current/)
+  const restoreRoute = ctx2.routes.find((entry) => entry.path === '/api/commit-listener/worktrees')
+  assert.equal(
+    (await restoreRoute.fetch(new Request('http://localhost/api/commit-listener/worktrees?session=restore-session'))).status,
+    200,
+    'agents map re-seeded from handoff entries',
+  )
+
+  // 'off' before a dispose prevents restore: explicit stops stay off.
+  result = await cmd2.handler({ agent: agent1, rawInput: 'off' })
+  assert.equal(result.kind, 'success')
+  for (const dispose of ctx2.disposers) dispose()
+  await commitFile(repo2, 'post.txt', 'post\n', 'after explicit off')
+  const ctx3 = mockContext()
+  apply(ctx3)
+  await sleep(POLL_MS + 1500)
+  assert.equal(agent1.followups.length, 2, 'off before dispose: nothing restores')
+
+  // agent/disposed clears the handoff entry: a closed session never restores.
+  const ctxA = mockContext()
+  apply(ctxA)
+  const cmdA = ctxA.registered[0]
+  await cmdA.handler({ agent: agent1, rawInput: '' })
+  ctxA.listeners.find(({ event }) => event === 'agent/disposed').callback({ agent: agent1 })
+  for (const dispose of ctxA.disposers) dispose()
+  const ctxB = mockContext()
+  apply(ctxB)
+  await commitFile(repo2, 'gone.txt', 'gone\n', 'session gone')
+  await sleep(POLL_MS + 1500)
+  assert.equal(agent1.followups.length, 2, 'agent/disposed cleared the handoff: nothing restores')
 }
 
 rmSync(root, { recursive: true, force: true })

@@ -89,8 +89,12 @@ The patch layer hot-reloads on long-lived surfaces (`patchReload: "live"`); othe
   the built-in prompt); `--set-picker=off` deactivates the picker so a bare run
   watches the session worktree without asking. Both persist in the plugin's own
   config through the profile config editor (survives restarts, editable in the
-  patch yml as `config: { prompt: …, picker: … }`); saving reloads the plugin,
-  which stops active listeners — re-run `/commit-listen` after changing.
+  patch yml as `config: { prompt: …, picker: … }`). Saving reloads the plugin's
+  fiber — active listeners now **re-arm automatically** from their last seen
+  commits (nothing missed, nothing reported twice; `/commit-listen --status`
+  confirms). Exceptions: a true *file* change re-imports the plugin module and
+  leaves listeners stopped (re-run `/commit-listen` after editing plugin
+  files), and an explicit `off` always stays off.
 - Worktree scoping: the default watches only the worktree containing the
   **session workspace** (`agent.session.header.cwd`) — linked worktrees hold
   private HEADs, so sibling commits never fire a turn. `--all` watches every
@@ -108,7 +112,11 @@ The patch layer hot-reloads on long-lived surfaces (`patchReload: "live"`); othe
   the composer hint re-registers with the real names — `--worktree=<repo|feat-x>`
   — so they are visible (and copyable) while typing; refreshed on session open
   and every 10 s. A single worktree keeps the generic form.
-- Stops on `/commit-listen off`, on session close (`agent/disposed`), and on plugin
-  unload/HMR (`ctx.effect` disposer).
+- Stops on `/commit-listen off`, on the composer chip's **×**, on session close
+  (`agent/disposed`), and on plugin unload/HMR (`ctx.effect` disposer) — with
+  one exception: a settings save is a config-only fiber update that reuses the
+  cached module instance, so a module-level handoff re-arms every listener
+  automatically after the reload. Explicit stops (`off`, chip **×**, session
+  close) stay off across any reload.
 - Commands never consume model context: results render in the UI only, while
   `command/run` / `command/done` land in the session log for auditability.
