@@ -4,14 +4,15 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin: `/
 watches the session workspace's git worktree and hands every new commit to the agent as a
 formal new turn (`agent.followup()` → next-turn inbox → append-only session log).
 Worktree-aware by default: `--all` watches every registered worktree,
-`--worktree=<name|path>` binds to one.
+`--worktree=<name|path>` binds to one, and a bare run in a multi-worktree repo
+**asks which one** through a clickable picker above the composer.
 
 ## Files
 
 ```
 package.json               dual-face manifest (dsh.client → lib/client.js)
-lib/index.js               host plugin: /commit-listen + worktree fetch route
-lib/client.js              browser half: composer worktree picker
+lib/index.js               host plugin: /commit-listen + worktree/pick fetch routes
+lib/client.js              browser half: composer worktree picker + pick panel
 test-commit-listener.mjs   self-check against a real temp git repo (node test-commit-listener.mjs)
 cordis.patch.yml           the patch-list overlay that loads the plugin
 ```
@@ -30,12 +31,16 @@ The patch layer hot-reloads on long-lived surfaces (`patchReload: "live"`); othe
 ## Usage
 
 ```
-/commit-listen                                # session worktree, default prompt
-/commit-listen Focus on security risks        # session worktree, custom prompt
+/commit-listen                                # multi-worktree repo: pick (click above the composer)
+/commit-listen Focus on security risks        # …with your instruction, kept for the pick
 /commit-listen --all                          # every registered worktree
 /commit-listen --worktree                     # list available worktrees
 /commit-listen --worktree=/                   # typing-time picker: menu completes a worktree name
 /commit-listen --worktree=feat-x              # one worktree, by name or path
+/commit-listen --set-prompt Focus on risks    # save the default analysis instruction (2.b)
+/commit-listen --set-prompt                   # clear it back to the built-in prompt
+/commit-listen --set-picker=off               # deactivate the picker (2.a): watch session worktree
+/commit-listen --config                       # show current settings
 /commit-listen off                            # stop watching
 ```
 
@@ -43,6 +48,21 @@ The patch layer hot-reloads on long-lived surfaces (`patchReload: "live"`); othe
   worktree. Bursts between polls coalesce into one turn per changed worktree
   reporting the full `base..latest` range (diffstat + truncated unified diff),
   labeled with that worktree's path and branch.
+- **Interactive picker (feat 1)**: when the repository has more than one
+  watchable (non-bare, with commits) worktree and no scope flag is given, the
+  command does not start anything — the browser half renders one full-width
+  panel above the composer (`conversation.input.dock`) with a button per
+  worktree (the session's tagged) plus an **All worktrees** button. A click
+  POSTs to the host's pick route and starts the listener with the invocation's
+  prompt; **×** dismisses. On the TUI (or wherever the panel cannot load) the
+  command result carries the plain discovery listing instead.
+- **Settings (2.a/2.b)**: `--set-prompt <text>` stores a global default
+  instruction (inline text at invocation still wins over it, and it wins over
+  the built-in prompt); `--set-picker=off` deactivates the picker so a bare run
+  watches the session worktree without asking. Both persist in the plugin's own
+  config through the profile config editor (survives restarts, editable in the
+  patch yml as `config: { prompt: …, picker: … }`); saving reloads the plugin,
+  which stops active listeners — re-run `/commit-listen` after changing.
 - Worktree scoping: the default watches only the worktree containing the
   **session workspace** (`agent.session.header.cwd`) — linked worktrees hold
   private HEADs, so sibling commits never fire a turn. `--all` watches every
