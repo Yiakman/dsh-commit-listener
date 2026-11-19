@@ -26,6 +26,21 @@ Append the insert entry from `cordis.patch.yml` to the live profile's user patch
 ~/.dsh/profiles/<profile>/cordis.patch.yml                                        # default DSH_HOME
 ```
 
+Use the **`file://` URL form** for the insert name (as in `cordis.patch.yml`):
+
+```yaml
+- insert:
+    - id: commit-listener
+      name: file:///abs/path/to/dsh-commit-listener/lib/index.js
+```
+
+A plain path loads the plugin fine, but dsh anchors inserted paths to `file://`
+URLs internally, and the profile **config editor then rejects every settings
+write** for the entry (`Configuration for "commit-listener" is overridden by a
+home patch or command-line overlay`) because its config row carries the live
+`file://` name while its own validation composes the plain-path row. The URL
+form is identical on both sides and settings save normally.
+
 The patch layer hot-reloads on long-lived surfaces (`patchReload: "live"`); otherwise restart the app.
 
 ## Usage
@@ -38,6 +53,7 @@ The patch layer hot-reloads on long-lived surfaces (`patchReload: "live"`); othe
 /commit-listen --worktree=/                   # typing-time picker: menu completes a worktree name
 /commit-listen --worktree=feat-x              # one worktree, by name or path
 /commit-listen --set-prompt Focus on risks    # save the default analysis instruction (2.b)
+/commit-listen --set-prompt="Focus on risks"  # …quoted values work too (one pair is stripped)
 /commit-listen --set-prompt                   # clear it back to the built-in prompt
 /commit-listen --set-picker=off               # deactivate the picker (2.a): watch session worktree
 /commit-listen --config                       # show current settings

@@ -296,6 +296,7 @@ The plugin declares **no `Config` schema** (it stays dependency-free — only No
 - Editing an ordinary config field **hot-reloads the plugin**: `apply` re-runs with the new values, which stops every active listener (same as any HMR). The `--set-*` results say so when listeners were running.
 - Both set flags in one invocation coalesce into a single edit (a second `edit()` on a replaced entry would throw `Configuration entry is no longer available`), and `--config` reads back the sanitized state at zero cost.
 - Prompt precedence is `inline text > configured default > built-in DEFAULT_PROMPT`, evaluated per invocation.
+- **The insert row's `name` must be a `file://` URL.** dsh anchors inserted plain paths to `file://` URLs when parsing a patch file, but the config editor's own validation composes its document *without* anchoring — so with a plain-path row, the editor's config row (named with the live `file://` name) fails its name-mismatch guard and every save dies as `overridden by a home patch or command-line overlay`. With a URL-form name both sides match and saves validate (verified against the installed 0.2.2-rc.3 sources).
 
 ### The Three Deterministic Disposal Paths
 

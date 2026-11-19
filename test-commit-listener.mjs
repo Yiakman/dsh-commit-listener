@@ -214,6 +214,57 @@ result = await invoke('--set-picker=maybe')
 assert.equal(result.kind, 'error')
 assert.match(result.text, /accepts "on" or "off"/)
 
+// --- settings saves through a mocked config editor: quoting and clear --------
+{
+  const saved = []
+  const settingsCtx = mockContext()
+  settingsCtx.fiber = { entry: { id: 'commit-listener' } }
+  settingsCtx.get = (name) =>
+    name === 'configEditor'
+      ? { edit: async (entry, change) => void saved.push(change({})) }
+      : undefined
+  apply(settingsCtx)
+  const settingsCommand = settingsCtx.registered[0]
+  const settingsAgent = mockAgent(repo)
+  const run = (rawInput) => settingsCommand.handler({ agent: settingsAgent, rawInput })
+
+  // bare form: rest of the line is the value
+  await run('--set-prompt Review each following commit.')
+  // bare form: one wrapping pair of quotes is stripped
+  await run('--set-prompt "Review each following commit."')
+  // =value form with a quoted value spanning words (the shell-style spelling)
+  await run('--set-prompt="Review each following commit. Identify the commit in the title with its hash."')
+  // =value form, single token
+  await run('--set-prompt=Shorthand')
+  // quoted value with an embedded single quote (typographic apostrophe)
+  await run(`--set-prompt="Don’t change the code."`)
+  // empty value clears
+  await run('--set-prompt')
+  await run('--set-picker=off')
+  await run('--set-picker=on')
+
+  const prompts = saved.map((config) => config.prompt)
+  assert.deepEqual(
+    prompts.slice(0, 5),
+    [
+      'Review each following commit.',
+      'Review each following commit.',
+      'Review each following commit. Identify the commit in the title with its hash.',
+      'Shorthand',
+      'Don’t change the code.',
+    ],
+    'every --set-prompt spelling saves the full text with quotes stripped',
+  )
+  assert.equal(prompts[5], undefined, 'bare --set-prompt clears the default')
+  assert.deepEqual(saved[6].picker, false, '--set-picker=off stored')
+  assert.deepEqual(saved[7].picker, true, '--set-picker=on stored')
+
+  const savedResult = await run('--set-prompt="Review each commit."')
+  assert.equal(savedResult.kind, 'success')
+  assert.match(savedResult.text, /Settings saved/)
+  assert.match(savedResult.text, /"Review each commit\."/)
+}
+
 // --- worktrees: linked worktree joins the repo -------------------------------
 const featDir = join(root, 'feat-x')
 await git(repo, 'worktree', 'add', '-q', '-b', 'feature-x', featDir)
