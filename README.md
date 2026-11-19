@@ -53,6 +53,7 @@ The patch layer hot-reloads on long-lived surfaces (`patchReload: "live"`); othe
 /commit-listen --worktree=/                   # typing-time picker: menu completes a worktree name
 /commit-listen --worktree=feat-x              # one worktree, by name or path
 /commit-listen --set-prompt Focus on risks    # save the default analysis instruction (2.b)
+/commit-listen --set-prompt="Focus on risks"  # …quoted values work too (one pair is stripped)
 /commit-listen --set-prompt                   # clear it back to the built-in prompt
 /commit-listen --set-picker=off               # deactivate the picker (2.a): watch session worktree
 /commit-listen --config                       # show current settings
