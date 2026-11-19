@@ -461,14 +461,14 @@ assert.deepEqual(await pickResponse.json(), { kind: 'success', text: 'Commit lis
 await commitFile(repo, 'm5.txt', 'm5\n', 'main commit 5')
 await sleep(POLL_MS + 1000)
 assert.equal(agent.followups.length, 8, 'listener stopped by the sentinel: no followup')
-// nothing was pending above, and a second stop is a no-op success
+// nothing was pending above, and a second stop is a truthful no-op success
 pickResponse = await pickRoute.fetch(
   new Request('http://localhost/api/commit-listener/pick?session=test-session', {
     method: 'POST',
     body: JSON.stringify({ target: '__stop__' }),
   }),
 )
-assert.equal((await pickResponse.json()).kind, 'success')
+assert.deepEqual(await pickResponse.json(), { kind: 'success', text: 'No commit listener was active.' })
 // the chip's poll reflects the stop…
 pickResponse = await pickRoute.fetch(new Request('http://localhost/api/commit-listener/pick?session=test-session'))
 assert.equal((await pickResponse.json()).listening, null)
@@ -597,6 +597,50 @@ assert.equal((await sessionResponse.json()).worktrees.length, 2)
   const Picker = slotRegistrations[0].component
   assert.equal(Picker({}), null, 'no session → nothing rendered')
   assert.equal(Picker({ session: { sessionId: 's1' } }), null, 'no pending pick → nothing rendered')
+
+  // Hook-order renders (useState queue stands in for a renderer): a pending
+  // pick with NO listener must not crash the chip's mode label, and a
+  // listening-only state renders the chip with a human mode label.
+  const renderWith = (stateQueue) => {
+    const queue = [...stateQueue]
+    const reactQ = {
+      createElement: react.createElement,
+      Fragment: react.Fragment,
+      useState: () => [queue.length > 0 ? queue.shift() : null, () => {}],
+      useEffect: () => undefined,
+    }
+    const pendingExports = loaded[0].factory((spec) => {
+      if (spec === 'react') return reactQ
+      throw new Error(`unexpected require: ${spec}`)
+    })
+    const regs = []
+    const qctx = {
+      get: (name) => (name === 'inputTriggers' ? { registerSource: () => noop() } : undefined),
+      effect: (execute) => {
+        const dispose = execute()
+        return () => dispose?.()
+      },
+      inject: (deps, callback) => callback(qctx),
+      slots: {
+        inject: (key, callback) => callback() ?? noop(),
+        register: (options, component) => (regs.push({ options, component }), noop()),
+      },
+    }
+    pendingExports.apply(qctx)
+    return regs[0].component({ session: { sessionId: 's1' } })
+  }
+  const entry = { name: 'repo', branch: 'main', head: 'a1b2c3d' }
+  // pending, listening, status, busy — chip label must not read listening.mode
+  let rendered = renderWith([{ prompt: '', worktrees: [{ ...entry, path: '/repo', session: true }] }, null, null, false])
+  assert.ok(Array.isArray(rendered.args) && rendered.args[0] === 'div', 'pending pick without a listener renders fine')
+  // listening only: chip carries the human label, panel body skipped
+  rendered = renderWith([null, { mode: 'worktree', target: '/x/feat-x', entries: [entry] }, null, false])
+  assert.equal(rendered.args[3].args[0], 'div', 'chip renders while listening without a pending pick')
+  assert.match(rendered.args[3].args[2].args[2], /listening: repo@a1b2c3d \(feat-x\)/, 'worktree mode shows the target name')
+  rendered = renderWith([null, { mode: 'current', target: null, entries: [entry] }, null, false])
+  assert.match(rendered.args[3].args[2].args[2], /\(session worktree\)/)
+  rendered = renderWith([null, { mode: 'all', target: null, entries: [entry] }, null, false])
+  assert.match(rendered.args[3].args[2].args[2], /\(all worktrees\)/)
 }
 
 // --- restore: listeners re-arm across a settings-save reload -------------------
@@ -614,6 +658,12 @@ assert.equal((await sessionResponse.json()).worktrees.length, 2)
   apply(ctx1)
   const cmd1 = ctx1.registered[0]
   const agent1 = mockAgent(repo2, 'restore-session')
+  // A second session that never starts a listener. DSH announces every agent
+  // through agent/created before any command can run in it.
+  const agentB = mockAgent(repo2, 'b-session')
+  const created1 = ctx1.listeners.find(({ event }) => event === 'agent/created')
+  created1.callback({ agent: agent1 })
+  created1.callback({ agent: agentB })
   result = await cmd1.handler({ agent: agent1, rawInput: '' })
   assert.equal(result.kind, 'success')
   await commitFile(repo2, 'pre.txt', 'pre\n', 'before reload')
@@ -649,7 +699,14 @@ assert.equal((await sessionResponse.json()).worktrees.length, 2)
   assert.equal(
     (await restoreRoute.fetch(new Request('http://localhost/api/commit-listener/worktrees?session=restore-session'))).status,
     200,
-    'agents map re-seeded from handoff entries',
+    'restored session resolves through the re-seeded agents map',
+  )
+  // Sessions WITHOUT a listener keep route resolution too: the module-level
+  // agents mirror (not the handoff) re-seeds every fresh apply.
+  assert.equal(
+    (await restoreRoute.fetch(new Request('http://localhost/api/commit-listener/worktrees?session=b-session'))).status,
+    200,
+    'agents mirror survives the reload for listener-less sessions',
   )
 
   // 'off' before a dispose prevents restore: explicit stops stay off.
