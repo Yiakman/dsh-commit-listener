@@ -57,6 +57,7 @@ The patch layer hot-reloads on long-lived surfaces (`patchReload: "live"`); othe
 /commit-listen --set-prompt                   # clear it back to the built-in prompt
 /commit-listen --set-picker=off               # deactivate the picker (2.a): watch session worktree
 /commit-listen --config                       # show current settings
+/commit-listen --status                       # what is listening (or pending) + settings, zero tokens
 /commit-listen off                            # stop watching
 ```
 
@@ -72,6 +73,17 @@ The patch layer hot-reloads on long-lived surfaces (`patchReload: "live"`); othe
   POSTs to the host's pick route and starts the listener with the invocation's
   prompt; **×** dismisses. On the TUI (or wherever the panel cannot load) the
   command result carries the plain discovery listing instead.
+- **Status query (`--status`)**: a UI-only, zero-token report of this session's
+  state: the mode (and target) in force, one line per watched worktree
+  (branch, name, short baseline HEAD — with an arrow once heads moved past the
+  start baseline), the prompt in force and where it came from (inline /
+  configured default / built-in), a pending worktree pick, and the persisted
+  settings. The same dock panel shows a persistent one-line
+  `listening: repo @ a1b2c3d (all)` chip with a **×** stop button while a
+  listener runs — no new route: `GET /api/commit-listener/pick` (the poll the
+  panel already runs) now carries a `listening` field, and
+  `POST {target:"__stop__"}` (a sentinel that is never a legal worktree name)
+  stops the listener whether or not a pick is pending.
 - **Settings (2.a/2.b)**: `--set-prompt <text>` stores a global default
   instruction (inline text at invocation still wins over it, and it wins over
   the built-in prompt); `--set-picker=off` deactivates the picker so a bare run

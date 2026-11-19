@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 
 const exec = promisify(execFile)
-const { apply, POLL_MS, parseWorktrees, hintFor } = await import('./lib/index.js')
+const { apply, POLL_MS, DEFAULT_PROMPT, parseWorktrees, hintFor } = await import('./lib/index.js')
 
 const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' }
 const IDENTITY = ['-c', 'user.name=tester', '-c', 'user.email=tester@example.com']
@@ -58,15 +58,18 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 // --- hintFor: ghost hint carries real worktree names --------------------------
 {
-  const GENERIC = '[--all | --worktree[=<name|path>]] <prompt> | --set-prompt <text> | --set-picker=on|off | off'
+  const GENERIC = '[--all | --worktree[=<name|path>]] <prompt> | --set-prompt <text> | --set-picker=on|off | --status | off'
+  assert.ok(GENERIC.length <= 150, 'generic hint stays within the composer budget')
+  assert.ok(GENERIC.includes('--status'), 'generic hint mentions --status')
   assert.equal(hintFor(['repo']), GENERIC, 'single worktree keeps the generic hint')
   assert.equal(
     hintFor(['repo', 'feat-x']),
-    '[--all | --worktree=<repo|feat-x>] <prompt> | --set-prompt <text> | --set-picker=on|off | off',
+    '[--all | --worktree=<repo|feat-x>] <prompt> | --set-prompt <text> | --set-picker=on|off | --status | off',
   )
   assert.ok(!hintFor(['has space', 'b', 'c']).includes('has space'), 'space-containing names are skipped')
   const long = hintFor(Array.from({ length: 8 }, (_, i) => `worktree-number-${i}-with-a-long-name`))
   assert.ok(long.length <= 150 && long.includes('…'), 'long lists truncate with an ellipsis')
+  assert.ok(long.includes('--status'), 'dynamic hint keeps --status while truncating names')
 }
 
 // --- parseWorktrees: porcelain fixture (spaces, detached, bare, unborn) ------
@@ -214,6 +217,14 @@ result = await invoke('--set-picker=maybe')
 assert.equal(result.kind, 'error')
 assert.match(result.text, /accepts "on" or "off"/)
 
+// --- --status with nothing active: idle report + settings ----------------------
+result = await invoke('--status')
+assert.equal(result.kind, 'success')
+assert.match(result.text, /No commit listener is active for this session\./)
+assert.match(result.text, /Start one with \/commit-listen/)
+assert.match(result.text, /picker: on/, 'persisted settings ride along')
+assert.match(result.text, /built-in analysis prompt/)
+
 // --- settings saves through a mocked config editor: quoting and clear --------
 {
   const saved = []
@@ -295,6 +306,7 @@ assert.equal(pickData.pending.worktrees.length, 2, 'only watchable worktrees off
 assert.ok(pickData.pending.worktrees.every((wt) => wt.name === 'repo' || wt.name === 'feat-x'))
 assert.equal(pickData.pending.worktrees.find((wt) => wt.name === 'repo').session, true, 'session worktree flagged')
 assert.equal(pickData.pending.worktrees.find((wt) => wt.name === 'feat-x').session, false)
+assert.equal(pickData.listening, null, 'listening is null before anything started')
 
 pickResponse = await pickRoute.fetch(
   new Request('http://localhost/api/commit-listener/pick?session=test-session', {
@@ -309,7 +321,17 @@ assert.match(startResult.text, /\(worktree\)/)
 assert.match(startResult.text, /feature-x/)
 
 pickResponse = await pickRoute.fetch(new Request('http://localhost/api/commit-listener/pick?session=test-session'))
-assert.equal((await pickResponse.json()).pending, null, 'no pending state left after the pick')
+pickData = await pickResponse.json()
+assert.equal(pickData.pending, null, 'no pending state left after the pick')
+// the same poll carries the live listener state for the composer chip
+assert.ok(pickData.listening, 'listening rides the pick poll once a listener runs')
+assert.equal(pickData.listening.mode, 'worktree')
+assert.equal(pickData.listening.target, 'feat-x')
+assert.equal(pickData.listening.prompt, DEFAULT_PROMPT, 'pick-started listener kept the parked prompt')
+assert.equal(pickData.listening.entries.length, 1)
+assert.equal(pickData.listening.entries[0].name, 'feat-x')
+assert.equal(pickData.listening.entries[0].branch, 'feature-x')
+assert.match(pickData.listening.entries[0].head, /^[0-9a-f]{7}$/, 'short HEAD, same shape as serializeWorktrees')
 
 // the route-started listener fires on the picked worktree only
 await commitFile(featDir, 'w1.txt', 'w1\n', 'feat: worktree commit 1')
@@ -376,6 +398,15 @@ assert.match(result.text, /feat-x/)
 // --- discovery is read-only: an active listener survives it -------------------
 result = await invoke('--worktree=repo') // explicit flag: no picker prompt
 assert.equal(result.kind, 'success')
+
+// --- --status while listening: mode, watched worktrees, baseline, prompt ------
+result = await invoke('--status')
+assert.equal(result.kind, 'success')
+assert.match(result.text, /Commit listener active for this session/)
+assert.match(result.text, /mode: worktree — target: repo/)
+assert.match(result.text, /\[main\] repo @ [0-9a-f]{7}\n/, 'watched line: branch, basename, short baseline HEAD')
+assert.match(result.text, /prompt: ".*" \(built-in\)/)
+
 result = await invoke('--worktree')
 assert.equal(result.kind, 'error')
 await commitFile(repo, 'm4.txt', 'm4\n', 'main commit 4')
@@ -391,6 +422,13 @@ result = await invoke('')
 assert.equal(result.kind, 'error')
 pickResponse = await pickRoute.fetch(new Request('http://localhost/api/commit-listener/pick?session=test-session'))
 assert.notEqual((await pickResponse.json()).pending, null, 'pending state exists while deciding')
+
+// --- --status while a pick is pending -------------------------------------------
+result = await invoke('--status')
+assert.equal(result.kind, 'success')
+assert.match(result.text, /waiting for worktree selection/i, 'pending pick is called out')
+assert.match(result.text, /2 worktrees offered/)
+
 pickResponse = await pickRoute.fetch(
   new Request('http://localhost/api/commit-listener/pick?session=test-session', { method: 'POST', body: '{}' }),
 )
@@ -403,6 +441,40 @@ result = await invoke('off')
 assert.equal(result.kind, 'success')
 pickResponse = await pickRoute.fetch(new Request('http://localhost/api/commit-listener/pick?session=test-session'))
 assert.equal((await pickResponse.json()).pending, null)
+
+// --- stop sentinel: POST __stop__ stops the listener, pending pick or not -----
+result = await invoke('--worktree=repo')
+assert.equal(result.kind, 'success')
+pickResponse = await pickRoute.fetch(
+  new Request('http://localhost/api/commit-listener/pick?session=test-session', {
+    method: 'POST',
+    body: JSON.stringify({ target: '__stop__' }),
+  }),
+)
+assert.equal(pickResponse.status, 200)
+assert.deepEqual(await pickResponse.json(), { kind: 'success', text: 'Commit listener stopped.' })
+await commitFile(repo, 'm5.txt', 'm5\n', 'main commit 5')
+await sleep(POLL_MS + 1000)
+assert.equal(agent.followups.length, 8, 'listener stopped by the sentinel: no followup')
+// nothing was pending above, and a second stop is a no-op success
+pickResponse = await pickRoute.fetch(
+  new Request('http://localhost/api/commit-listener/pick?session=test-session', {
+    method: 'POST',
+    body: JSON.stringify({ target: '__stop__' }),
+  }),
+)
+assert.equal((await pickResponse.json()).kind, 'success')
+// the chip's poll reflects the stop…
+pickResponse = await pickRoute.fetch(new Request('http://localhost/api/commit-listener/pick?session=test-session'))
+assert.equal((await pickResponse.json()).listening, null)
+// …and an unknown session errors instead of reporting a phantom stop
+pickResponse = await pickRoute.fetch(
+  new Request('http://localhost/api/commit-listener/pick?session=unknown-session', {
+    method: 'POST',
+    body: JSON.stringify({ target: '__stop__' }),
+  }),
+)
+assert.equal(pickResponse.status, 400)
 
 // --- setting picker:false — bare invocation proceeds with the session worktree
 const quietCtx = mockContext()
