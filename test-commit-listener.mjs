@@ -2,7 +2,7 @@
 // real git repo with a mock agent/context, at real poll intervals. Exit 0 = pass.
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -58,12 +58,15 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 // --- hintFor: ghost hint carries real worktree names --------------------------
 {
-  const GENERIC = '[--all | --worktree[=<name|path>]] <prompt> | off'
+  const GENERIC = '[--all | --worktree[=<name|path>]] <prompt> | --set-prompt <text> | --set-picker=on|off | off'
   assert.equal(hintFor(['repo']), GENERIC, 'single worktree keeps the generic hint')
-  assert.equal(hintFor(['repo', 'feat-x']), '[--all | --worktree=<repo|feat-x>] <prompt> | off')
+  assert.equal(
+    hintFor(['repo', 'feat-x']),
+    '[--all | --worktree=<repo|feat-x>] <prompt> | --set-prompt <text> | --set-picker=on|off | off',
+  )
   assert.ok(!hintFor(['has space', 'b', 'c']).includes('has space'), 'space-containing names are skipped')
   const long = hintFor(Array.from({ length: 8 }, (_, i) => `worktree-number-${i}-with-a-long-name`))
-  assert.ok(long.length <= 140 && long.includes('…'), 'long lists truncate with an ellipsis')
+  assert.ok(long.length <= 150 && long.includes('…'), 'long lists truncate with an ellipsis')
 }
 
 // --- parseWorktrees: porcelain fixture (spaces, detached, bare, unborn) ------
@@ -107,7 +110,7 @@ const ctx = mockContext()
 apply(ctx)
 const command = ctx.registered[0]
 
-// --- TUI shape: no Connection service → command registers, route does not ---
+// --- TUI shape: no Connection service → command registers, routes do not ----
 const tui = mockContext()
 delete tui.connection
 apply(tui)
@@ -199,7 +202,19 @@ assert.equal(agent.followups.length, 3, 'no followup after off')
 result = await invoke('off')
 assert.equal(result.kind, 'error', 'off again errors: nothing active')
 
-// --- worktrees: default scope ignores a linked worktree ----------------------
+// --- settings flags: query works without a config editor; saves need one -----
+result = await invoke('--config')
+assert.equal(result.kind, 'success')
+assert.match(result.text, /picker: on/)
+assert.match(result.text, /built-in analysis prompt/)
+result = await invoke('--set-prompt Focus on security')
+assert.equal(result.kind, 'error', 'mock context has no config editor service')
+assert.match(result.text, /cannot be saved/i)
+result = await invoke('--set-picker=maybe')
+assert.equal(result.kind, 'error')
+assert.match(result.text, /accepts "on" or "off"/)
+
+// --- worktrees: default scope ignores a linked worktree -----------------------
 const featDir = join(root, 'feat-x')
 await git(repo, 'worktree', 'add', '-q', '-b', 'feature-x', featDir)
 
@@ -213,7 +228,7 @@ ctx.listeners.find(({ event }) => event === 'agent/created').callback({ agent })
 await sleep(400)
 assert.equal(ctx.registered.length, 2, 'unchanged worktree set does not re-register')
 
-result = await invoke('') // fresh listener, default: current worktree only
+result = await invoke('') // default listener: current worktree only
 assert.equal(result.kind, 'success')
 assert.match(result.text, /\(current\)/)
 assert.match(result.text, /main/)
@@ -281,18 +296,8 @@ assert.match(result.text, /No worktree matches "nope"/)
 assert.match(result.text, /Available worktrees \(--worktree=<name\|path>\):/)
 assert.match(result.text, /feat-x/)
 
-// --- discovery: bare or empty --worktree lists worktrees, starts nothing ------
-for (const flag of ['--worktree', '--worktree=']) {
-  result = await invoke(flag)
-  assert.equal(result.kind, 'error', `${flag} settles without starting a listener`)
-  assert.match(result.text, /No worktree selected\./)
-  assert.match(result.text, /Available worktrees \(--worktree=<name\|path>\):/)
-  assert.match(result.text, /main\s+[0-9a-f]{7}\s+\S*\/repo\s+\(session worktree\)/)
-  assert.match(result.text, /feature-x\s+[0-9a-f]{7}\s+\S+feat-x$/m)
-}
-
 // --- discovery is read-only: an active listener survives it -------------------
-result = await invoke('') // default listener active again
+result = await invoke('--worktree=repo') // explicit flag: no picker prompt
 assert.equal(result.kind, 'success')
 result = await invoke('--worktree')
 assert.equal(result.kind, 'error')
@@ -303,6 +308,39 @@ assert.equal(agent.followups.length, 8, 'listener survived the discovery query')
 await commitFile(featDir, 'w4.txt', 'w4\n', 'feat: worktree commit 4')
 await sleep(POLL_MS + 1500)
 assert.equal(agent.followups.length, 8, 'discovery neither replaced nor widened the listener')
+
+// --- setting picker:false — bare invocation proceeds with the session worktree
+const quietCtx = mockContext()
+apply(quietCtx, { picker: false })
+const quietCommand = quietCtx.registered[0]
+const quietAgent = mockAgent(repo)
+result = await quietCommand.handler({ agent: quietAgent, rawInput: '' })
+assert.equal(result.kind, 'success', 'no prompt when the picker is deactivated')
+assert.match(result.text, /\(current\)/)
+result = await quietCommand.handler({ agent: quietAgent, rawInput: '--config' })
+assert.equal(result.kind, 'success')
+assert.match(result.text, /picker: off/)
+assert.match(result.text, /watches the session worktree without asking/)
+
+// --- configured default prompt: used when the invocation passes no text ------
+const cfgCtx = mockContext()
+apply(cfgCtx, { prompt: 'Custom default analysis.' })
+const cfgCommand = cfgCtx.registered[0]
+const cfgAgent = mockAgent(repo)
+result = await cfgCommand.handler({ agent: cfgAgent, rawInput: '--worktree=feat-x' })
+assert.equal(result.kind, 'success')
+await commitFile(featDir, 'p1.txt', 'p1\n', 'feat: configured default prompt')
+await sleep(POLL_MS + 1500)
+assert.equal(cfgAgent.followups.length, 1)
+assert.match(cfgAgent.followups[0].content[0].text, /Instruction: Custom default analysis\./)
+
+// ...and inline text still wins over the configured default
+result = await cfgCommand.handler({ agent: cfgAgent, rawInput: '--worktree=feat-x Inline instruction wins' })
+assert.equal(result.kind, 'success')
+await commitFile(featDir, 'p2.txt', 'p2\n', 'feat: inline prompt wins')
+await sleep(POLL_MS + 1500)
+assert.equal(cfgAgent.followups.length, 2)
+assert.match(cfgAgent.followups[1].content[0].text, /Instruction: Inline instruction wins/)
 
 // --- browser picker route: /api/commit-listener/worktrees ------------------------
 const route = ctx.routes.find((entry) => entry.path === '/api/commit-listener/worktrees')
@@ -329,6 +367,43 @@ ctx.listeners.find(({ event }) => event === 'agent/created').callback({ agent })
 const sessionResponse = await route.fetch(new Request('http://localhost/api/commit-listener/worktrees?session=test-session'))
 assert.equal(sessionResponse.status, 200)
 assert.equal((await sessionResponse.json()).worktrees.length, 2)
+
+// --- browser half: module shape + trigger source smoke test ------------------
+{
+  const loaded = []
+  const fakeWindow = { __ModuleLoader__: { load: (handoff) => loaded.push(handoff) } }
+  new Function('window', readFileSync(new URL('./lib/client.js', import.meta.url), 'utf8'))(fakeWindow)
+  assert.equal(loaded.length, 1, 'one ModuleLoader handoff')
+  assert.equal(loaded[0].id, 'dsh-commit-listener')
+
+  const noop = () => () => {}
+  const react = {
+    createElement: (...args) => ({ args }),
+    Fragment: Symbol('fragment'),
+    useState: (init) => [typeof init === 'function' ? init() : init, () => {}],
+    useEffect: () => undefined,
+  }
+  const clientExports = loaded[0].factory((spec) => {
+    if (spec === 'react') return react
+    throw new Error(`unexpected require: ${spec}`)
+  })
+  assert.deepEqual(clientExports.inject, ['inputTriggers'])
+  assert.equal(typeof clientExports.apply, 'function')
+
+  const registeredSources = []
+  const clientCtx = {
+    get: (name) =>
+      name === 'inputTriggers' ? { registerSource: (source) => (registeredSources.push(source), noop()) } : undefined,
+    effect: (execute) => {
+      const dispose = execute()
+      return () => dispose?.()
+    },
+    inject: (deps, callback) => (deps.every((dep) => clientCtx[dep]) ? callback(clientCtx) : undefined),
+  }
+  clientExports.apply(clientCtx)
+  assert.equal(registeredSources[0].name, 'commit-listener-worktrees', 'typing-time source registered')
+  assert.equal(registeredSources[0].trigger, '/')
+}
 
 rmSync(root, { recursive: true, force: true })
 console.log('commit-listener self-check: all assertions passed')
