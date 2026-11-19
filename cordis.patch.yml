@@ -1,6 +1,14 @@
 # Patch-list overlay: load the commit-listener plugin into any dsh profile.
 # Usage: dsh web --patch /Users/eduardosoto/Code/dsh-commit-listener/cordis.patch.yml
 # (or paste the insert entry into the profile's user patch layer)
+#
+# The insert name MUST be a file:// URL, not a plain path: dsh anchors inserted
+# plain paths to file:// URLs when it loads a patch file, so a plain-path row
+# makes the profile config editor reject writes for this entry ("Configuration
+# for "commit-listener" is overridden by a home patch or command-line
+# overlay") — the editor's config row carries the live file:// name and never
+# matches the un-anchored insert row during its own validation. A URL-form
+# name is identical on both sides, and /commit-listen --set-prompt then saves.
 - insert:
     - id: commit-listener
-      name: /Users/eduardosoto/Code/dsh-commit-listener/lib/index.js
+      name: file:///Users/eduardosoto/Code/dsh-commit-listener/lib/index.js
