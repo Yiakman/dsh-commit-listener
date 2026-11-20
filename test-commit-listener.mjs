@@ -2,7 +2,7 @@
 // real git repo with a mock agent/context, at real poll intervals. Exit 0 = pass.
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -15,6 +15,11 @@ const IDENTITY = ['-c', 'user.name=tester', '-c', 'user.email=tester@example.com
 
 async function git(cwd, ...args) {
   await exec('git', [...IDENTITY, ...args], { cwd, env: GIT_ENV })
+}
+
+/** Full SHA of `ref` (default HEAD) — the truncation notes carry full SHAs. */
+async function sha(cwd, ref = 'HEAD') {
+  return (await exec('git', ['-C', cwd, 'rev-parse', ref], { env: GIT_ENV })).stdout.trim()
 }
 
 function commitFile(cwd, name, content, message) {
@@ -111,6 +116,9 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const root = mkdtempSync(join(tmpdir(), 'commit-listener-test-'))
 const repo = join(root, 'repo')
 mkdirSync(repo)
+// git prints worktree paths with symlinks resolved (/var → /private/var on
+// macOS); the truncation-note assertions must compare against that form.
+const repoGitPath = realpathSync(repo)
 await git(repo, 'init', '-q', '-b', 'main')
 await commitFile(repo, 'README.md', 'hello\n', 'initial commit')
 
@@ -172,16 +180,26 @@ assert.match(text, /add a\.txt/)
 assert.match(text, /add b\.txt/)
 assert.match(text, /```diff/)
 assert.match(text, /Instruction: /, 'default analysis prompt present')
+assert.ok(!text.includes('Note: '), 'a small commit carries no truncation notes')
 
-// --- big commit: diff truncated ----------------------------------------------
+// --- big commit: diff truncated, with the self-serve recovery hint -----------
+const bigPrev = await sha(repo)
 writeFileSync(join(repo, 'big.txt'), 'x'.repeat(200_000) + '\n')
 await git(repo, 'add', '-A')
 await git(repo, 'commit', '-q', '-m', 'add big file')
+const bigLatest = await sha(repo)
 await sleep(POLL_MS + 1500)
 assert.equal(agent.followups.length, 2, 'second followup arrives')
 const bigText = agent.followups[1].content[0].text
 assert.match(bigText, /1 new commit on main/)
 assert.match(bigText, /\[\.\.\. diff truncated \.\.\.\]/)
+assert.ok(
+  bigText.includes(
+    `Note: the diff above was truncated at 7500 characters — the full diff is available with \`git -C ${repoGitPath} diff ${bigPrev} ${bigLatest}\`.`,
+  ),
+  'truncation note carries the self-serve command with full SHAs',
+)
+assert.ok(!bigText.includes('Note: the commit list'), 'no commit-cap note for a single commit')
 assert.ok(bigText.length < 20_000, 'notification stays small')
 
 // --- custom prompt is used ----------------------------------------------------
@@ -731,6 +749,51 @@ assert.equal((await sessionResponse.json()).worktrees.length, 2)
   await commitFile(repo2, 'gone.txt', 'gone\n', 'session gone')
   await sleep(POLL_MS + 1500)
   assert.equal(agent1.followups.length, 2, 'agent/disposed cleared the handoff: nothing restores')
+}
+
+// --- commit-cap hint: 26 quick commits trip the 25-entry cap ------------------
+{
+  const capCtx = mockContext()
+  apply(capCtx)
+  const capCommand = capCtx.registered[0]
+  const capAgent = mockAgent(repo)
+  const capPrev = await sha(repo)
+  const capResult = await capCommand.handler({ agent: capAgent, rawInput: '--worktree=repo' })
+  assert.equal(capResult.kind, 'success')
+  for (let i = 1; i <= 26; i++) await git(repo, 'commit', '-q', '--allow-empty', '-m', `bulk commit ${i}`)
+  const capLatest = await sha(repo)
+  await sleep(POLL_MS + 1500)
+  assert.equal(capAgent.followups.length, 1, 'the burst coalesces into one turn')
+  const capText = capAgent.followups[0].content[0].text
+  assert.match(capText, /25 new commits on main/, 'header counts the 25 listed commits')
+  assert.match(capText, /\(list capped at 25 commits\)/)
+  assert.ok(
+    capText.includes(
+      `Note: the commit list above was capped at 25 entries — the full log is available with \`git -C ${repoGitPath} log --oneline ${capPrev}..${capLatest}\`.`,
+    ),
+    'cap note carries the self-serve log command with the full range',
+  )
+  assert.ok(!capText.includes('Note: the diff above'), 'no diff note when the diff fits')
+}
+
+// --- diffstat cap: one commit touching 35 files truncates the stat block ------
+{
+  const statCtx = mockContext()
+  apply(statCtx)
+  const statCommand = statCtx.registered[0]
+  const statAgent = mockAgent(repo)
+  const statResult = await statCommand.handler({ agent: statAgent, rawInput: '--worktree=repo' })
+  assert.equal(statResult.kind, 'success')
+  for (let i = 1; i <= 35; i++) writeFileSync(join(repo, `s${i}.txt`), 'x\n')
+  await git(repo, 'add', '-A')
+  await git(repo, 'commit', '-q', '-m', 'add 35 small files')
+  await sleep(POLL_MS + 1500)
+  assert.equal(statAgent.followups.length, 1)
+  const statText = statAgent.followups[0].content[0].text
+  assert.match(statText, /1 new commit on main/)
+  assert.match(statText, /\(\.\.\. diffstat truncated, 6 more lines \.\.\.\)/, 'stat block truncated with the omitted count')
+  assert.ok(!statText.includes('[... diff truncated ...]'), 'small per-file diffs stay whole')
+  assert.ok(!statText.includes('Note: '), 'no note lines for the stat-only truncation')
 }
 
 rmSync(root, { recursive: true, force: true })

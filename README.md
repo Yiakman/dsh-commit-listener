@@ -64,7 +64,12 @@ The patch layer hot-reloads on long-lived surfaces (`patchReload: "live"`); othe
 - Polls `git worktree list --porcelain` every 2.5 s — one subprocess covers every
   worktree. Bursts between polls coalesce into one turn per changed worktree
   reporting the full `base..latest` range (diffstat + truncated unified diff),
-  labeled with that worktree's path and branch.
+  labeled with that worktree's path and branch. Truncation is self-serve: when
+  the diff was cut at 7,500 characters or the commit list hit its 25-entry cap,
+  the turn carries a `Note:` line with the exact `git -C <worktree> diff` /
+  `git -C <worktree> log --oneline` command (full SHAs) so the agent — which
+  has shell access — can retrieve the rest itself; the diffstat is bounded at
+  30 lines with a truncation marker.
 - **Interactive picker (feat 1)**: when the repository has more than one
   watchable (non-bare, with commits) worktree and no scope flag is given, the
   command does not start anything — the browser half renders one full-width
