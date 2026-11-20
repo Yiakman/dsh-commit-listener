@@ -333,8 +333,9 @@ graph TD
 
 ### Fault Tolerance
 
-- **Transient Git Failures**: Index locks, rebases, or garbage collection can cause temporary `git rev-parse` failures. The poll loop silently catches these errors and retries on the next tick.
-- **Vanished Workspaces**: If a tick fails and `existsSync(cwd)` returns `false` (e.g., deleted temporary directory), the listener self-terminates.
+- **Transient Git Failures**: Index locks, rebases, or garbage collection can cause temporary `git` failures. The poll loop catches these and retries on the next tick; any fully successful tick resets the consecutive-failure counter.
+- **Bounded Failures**: A repository that breaks while its directory remains (unmounted drive, corrupted `.git`) no longer retries forever. After `MAX_CONSECUTIVE_FAILURES` consecutive failed ticks — 10 by default (≈25 s at the 2.5 s poll, safely above transient rebase/gc/index-lock hiccups), overridable at module load via `COMMIT_LISTENER_MAX_FAILURES`, or per listener through `startListener`'s trailing `options.maxFailures` — the listener performs the standard stop (clearInterval + removal from the listener map) and delivers **exactly one** final `followup()` turn: `[commit-listener] Listening stopped: git failed N consecutive times at <cwd> (<last error>). No further commits will be reported — re-run /commit-listen to start again.` followed by the standard injection guardrail (the error text is external data). The notification is best-effort — a disposed agent may throw — and at most one fires per listener lifetime; after the stop, later ticks and commits produce nothing.
+- **Vanished Workspaces**: If a tick fails and `existsSync(cwd)` returns `false` (e.g., deleted temporary directory), the listener self-terminates through the same path — now with an analogous best-effort final turn ("workspace <cwd> no longer exists") instead of dying silently.
 - **Idempotent Restarts**: Invoking `/commit-listen` again in the same session disposes of any existing timer before starting a new one.
 
 ---

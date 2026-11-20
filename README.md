@@ -70,6 +70,15 @@ The patch layer hot-reloads on long-lived surfaces (`patchReload: "live"`); othe
   `git -C <worktree> log --oneline` command (full SHAs) so the agent — which
   has shell access — can retrieve the rest itself; the diffstat is bounded at
   30 lines with a truncation marker.
+- Failure guard: a repository that breaks while its directory remains
+  (unmounted drive, corrupted `.git`) no longer silences the listener forever —
+  after 10 consecutive failed polls (≈25 s) the listener stops and delivers
+  exactly one final turn saying so, with the last git error wrapped in the
+  standard guardrail; re-run `/commit-listen` to start again. Transient
+  failures (rebase, gc, index lock) heal silently — the counter resets on any
+  successful poll. `COMMIT_LISTENER_MAX_FAILURES` overrides the threshold
+  (read at module load); a vanished workspace stops the same way, with a
+  best-effort notice.
 - **Interactive picker (feat 1)**: when the repository has more than one
   watchable (non-bare, with commits) worktree and no scope flag is given, the
   command does not start anything — the browser half renders one full-width
@@ -118,10 +127,12 @@ The patch layer hot-reloads on long-lived surfaces (`patchReload: "live"`); othe
   — so they are visible (and copyable) while typing; refreshed on session open
   and every 10 s. A single worktree keeps the generic form.
 - Stops on `/commit-listen off`, on the composer chip's **×**, on session close
-  (`agent/disposed`), and on plugin unload/HMR (`ctx.effect` disposer) — with
-  one exception: a settings save is a config-only fiber update that reuses the
-  cached module instance, so a module-level handoff re-arms every listener
-  automatically after the reload. Explicit stops (`off`, chip **×**, session
-  close) stay off across any reload.
+  (`agent/disposed`), on plugin unload/HMR (`ctx.effect` disposer), and through
+  the failure guard above (persistent git failures or a vanished workspace —
+  each with exactly one final notification turn). One exception: a settings
+  save is a config-only fiber update that reuses the cached module instance, so
+  a module-level handoff re-arms every listener automatically after the reload.
+  Explicit stops (`off`, chip **×**, session close, and failure-guard halts)
+  stay off across any reload.
 - Commands never consume model context: results render in the UI only, while
   `command/run` / `command/done` land in the session log for auditability.
