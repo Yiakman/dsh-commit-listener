@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 
 const exec = promisify(execFile)
-const { apply, POLL_MS, parseWorktrees, hintFor } = await import('./lib/index.js')
+const { apply, POLL_MS, DEFAULT_PROMPT, parseWorktrees, hintFor } = await import('./lib/index.js')
 
 const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' }
 const IDENTITY = ['-c', 'user.name=tester', '-c', 'user.email=tester@example.com']
@@ -26,11 +26,15 @@ function mockContext() {
   const registered = []
   const listeners = []
   const routes = []
+  const disposers = []
   const ctx = {
     commands: { register: (definition) => (registered.push(definition), () => {}) },
-    connection: { fetch: { register: (route) => routes.push(route) } },
+    connection: { fetch: { register: (route) => (routes.push(route), () => {}) } },
     effect: (execute) => {
       const dispose = execute()
+      // Cordis runs every effect disposer on fiber dispose; keeping them lets
+      // the restore tests simulate the settings-save reload exactly.
+      disposers.push(dispose)
       return () => dispose?.()
     },
     on: (event, callback) => (listeners.push({ event, callback }), () => {}),
@@ -40,14 +44,15 @@ function mockContext() {
     registered,
     listeners,
     routes,
+    disposers,
   }
   return ctx
 }
 
-function mockAgent(cwd) {
+function mockAgent(cwd, id = 'test-session') {
   const followups = []
   return {
-    id: 'test-session',
+    id,
     session: { header: { cwd } },
     followup: (message) => followups.push(message),
     followups,
@@ -58,15 +63,18 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 // --- hintFor: ghost hint carries real worktree names --------------------------
 {
-  const GENERIC = '[--all | --worktree[=<name|path>]] <prompt> | --set-prompt <text> | --set-picker=on|off | off'
+  const GENERIC = '[--all | --worktree[=<name|path>]] <prompt> | --set-prompt <text> | --set-picker=on|off | --status | off'
+  assert.ok(GENERIC.length <= 150, 'generic hint stays within the composer budget')
+  assert.ok(GENERIC.includes('--status'), 'generic hint mentions --status')
   assert.equal(hintFor(['repo']), GENERIC, 'single worktree keeps the generic hint')
   assert.equal(
     hintFor(['repo', 'feat-x']),
-    '[--all | --worktree=<repo|feat-x>] <prompt> | --set-prompt <text> | --set-picker=on|off | off',
+    '[--all | --worktree=<repo|feat-x>] <prompt> | --set-prompt <text> | --set-picker=on|off | --status | off',
   )
   assert.ok(!hintFor(['has space', 'b', 'c']).includes('has space'), 'space-containing names are skipped')
   const long = hintFor(Array.from({ length: 8 }, (_, i) => `worktree-number-${i}-with-a-long-name`))
   assert.ok(long.length <= 150 && long.includes('…'), 'long lists truncate with an ellipsis')
+  assert.ok(long.includes('--status'), 'dynamic hint keeps --status while truncating names')
 }
 
 // --- parseWorktrees: porcelain fixture (spaces, detached, bare, unborn) ------
@@ -214,6 +222,14 @@ result = await invoke('--set-picker=maybe')
 assert.equal(result.kind, 'error')
 assert.match(result.text, /accepts "on" or "off"/)
 
+// --- --status with nothing active: idle report + settings ----------------------
+result = await invoke('--status')
+assert.equal(result.kind, 'success')
+assert.match(result.text, /No commit listener is active for this session\./)
+assert.match(result.text, /Start one with \/commit-listen/)
+assert.match(result.text, /picker: on/, 'persisted settings ride along')
+assert.match(result.text, /built-in analysis prompt/)
+
 // --- settings saves through a mocked config editor: quoting and clear --------
 {
   const saved = []
@@ -295,6 +311,7 @@ assert.equal(pickData.pending.worktrees.length, 2, 'only watchable worktrees off
 assert.ok(pickData.pending.worktrees.every((wt) => wt.name === 'repo' || wt.name === 'feat-x'))
 assert.equal(pickData.pending.worktrees.find((wt) => wt.name === 'repo').session, true, 'session worktree flagged')
 assert.equal(pickData.pending.worktrees.find((wt) => wt.name === 'feat-x').session, false)
+assert.equal(pickData.listening, null, 'listening is null before anything started')
 
 pickResponse = await pickRoute.fetch(
   new Request('http://localhost/api/commit-listener/pick?session=test-session', {
@@ -309,7 +326,17 @@ assert.match(startResult.text, /\(worktree\)/)
 assert.match(startResult.text, /feature-x/)
 
 pickResponse = await pickRoute.fetch(new Request('http://localhost/api/commit-listener/pick?session=test-session'))
-assert.equal((await pickResponse.json()).pending, null, 'no pending state left after the pick')
+pickData = await pickResponse.json()
+assert.equal(pickData.pending, null, 'no pending state left after the pick')
+// the same poll carries the live listener state for the composer chip
+assert.ok(pickData.listening, 'listening rides the pick poll once a listener runs')
+assert.equal(pickData.listening.mode, 'worktree')
+assert.equal(pickData.listening.target, 'feat-x')
+assert.equal(pickData.listening.prompt, DEFAULT_PROMPT, 'pick-started listener kept the parked prompt')
+assert.equal(pickData.listening.entries.length, 1)
+assert.equal(pickData.listening.entries[0].name, 'feat-x')
+assert.equal(pickData.listening.entries[0].branch, 'feature-x')
+assert.match(pickData.listening.entries[0].head, /^[0-9a-f]{7}$/, 'short HEAD, same shape as serializeWorktrees')
 
 // the route-started listener fires on the picked worktree only
 await commitFile(featDir, 'w1.txt', 'w1\n', 'feat: worktree commit 1')
@@ -376,6 +403,15 @@ assert.match(result.text, /feat-x/)
 // --- discovery is read-only: an active listener survives it -------------------
 result = await invoke('--worktree=repo') // explicit flag: no picker prompt
 assert.equal(result.kind, 'success')
+
+// --- --status while listening: mode, watched worktrees, baseline, prompt ------
+result = await invoke('--status')
+assert.equal(result.kind, 'success')
+assert.match(result.text, /Commit listener active for this session/)
+assert.match(result.text, /mode: worktree — target: repo/)
+assert.match(result.text, /\[main\] repo @ [0-9a-f]{7}\n/, 'watched line: branch, basename, short baseline HEAD')
+assert.match(result.text, /prompt: ".*" \(built-in\)/)
+
 result = await invoke('--worktree')
 assert.equal(result.kind, 'error')
 await commitFile(repo, 'm4.txt', 'm4\n', 'main commit 4')
@@ -391,6 +427,13 @@ result = await invoke('')
 assert.equal(result.kind, 'error')
 pickResponse = await pickRoute.fetch(new Request('http://localhost/api/commit-listener/pick?session=test-session'))
 assert.notEqual((await pickResponse.json()).pending, null, 'pending state exists while deciding')
+
+// --- --status while a pick is pending -------------------------------------------
+result = await invoke('--status')
+assert.equal(result.kind, 'success')
+assert.match(result.text, /waiting for worktree selection/i, 'pending pick is called out')
+assert.match(result.text, /2 worktrees offered/)
+
 pickResponse = await pickRoute.fetch(
   new Request('http://localhost/api/commit-listener/pick?session=test-session', { method: 'POST', body: '{}' }),
 )
@@ -403,6 +446,40 @@ result = await invoke('off')
 assert.equal(result.kind, 'success')
 pickResponse = await pickRoute.fetch(new Request('http://localhost/api/commit-listener/pick?session=test-session'))
 assert.equal((await pickResponse.json()).pending, null)
+
+// --- stop sentinel: POST __stop__ stops the listener, pending pick or not -----
+result = await invoke('--worktree=repo')
+assert.equal(result.kind, 'success')
+pickResponse = await pickRoute.fetch(
+  new Request('http://localhost/api/commit-listener/pick?session=test-session', {
+    method: 'POST',
+    body: JSON.stringify({ target: '__stop__' }),
+  }),
+)
+assert.equal(pickResponse.status, 200)
+assert.deepEqual(await pickResponse.json(), { kind: 'success', text: 'Commit listener stopped.' })
+await commitFile(repo, 'm5.txt', 'm5\n', 'main commit 5')
+await sleep(POLL_MS + 1000)
+assert.equal(agent.followups.length, 8, 'listener stopped by the sentinel: no followup')
+// nothing was pending above, and a second stop is a truthful no-op success
+pickResponse = await pickRoute.fetch(
+  new Request('http://localhost/api/commit-listener/pick?session=test-session', {
+    method: 'POST',
+    body: JSON.stringify({ target: '__stop__' }),
+  }),
+)
+assert.deepEqual(await pickResponse.json(), { kind: 'success', text: 'No commit listener was active.' })
+// the chip's poll reflects the stop…
+pickResponse = await pickRoute.fetch(new Request('http://localhost/api/commit-listener/pick?session=test-session'))
+assert.equal((await pickResponse.json()).listening, null)
+// …and an unknown session errors instead of reporting a phantom stop
+pickResponse = await pickRoute.fetch(
+  new Request('http://localhost/api/commit-listener/pick?session=unknown-session', {
+    method: 'POST',
+    body: JSON.stringify({ target: '__stop__' }),
+  }),
+)
+assert.equal(pickResponse.status, 400)
 
 // --- setting picker:false — bare invocation proceeds with the session worktree
 const quietCtx = mockContext()
@@ -520,6 +597,140 @@ assert.equal((await sessionResponse.json()).worktrees.length, 2)
   const Picker = slotRegistrations[0].component
   assert.equal(Picker({}), null, 'no session → nothing rendered')
   assert.equal(Picker({ session: { sessionId: 's1' } }), null, 'no pending pick → nothing rendered')
+
+  // Hook-order renders (useState queue stands in for a renderer): a pending
+  // pick with NO listener must not crash the chip's mode label, and a
+  // listening-only state renders the chip with a human mode label.
+  const renderWith = (stateQueue) => {
+    const queue = [...stateQueue]
+    const reactQ = {
+      createElement: react.createElement,
+      Fragment: react.Fragment,
+      useState: () => [queue.length > 0 ? queue.shift() : null, () => {}],
+      useEffect: () => undefined,
+    }
+    const pendingExports = loaded[0].factory((spec) => {
+      if (spec === 'react') return reactQ
+      throw new Error(`unexpected require: ${spec}`)
+    })
+    const regs = []
+    const qctx = {
+      get: (name) => (name === 'inputTriggers' ? { registerSource: () => noop() } : undefined),
+      effect: (execute) => {
+        const dispose = execute()
+        return () => dispose?.()
+      },
+      inject: (deps, callback) => callback(qctx),
+      slots: {
+        inject: (key, callback) => callback() ?? noop(),
+        register: (options, component) => (regs.push({ options, component }), noop()),
+      },
+    }
+    pendingExports.apply(qctx)
+    return regs[0].component({ session: { sessionId: 's1' } })
+  }
+  const entry = { name: 'repo', branch: 'main', head: 'a1b2c3d' }
+  // pending, listening, status, busy — chip label must not read listening.mode
+  let rendered = renderWith([{ prompt: '', worktrees: [{ ...entry, path: '/repo', session: true }] }, null, null, false])
+  assert.ok(Array.isArray(rendered.args) && rendered.args[0] === 'div', 'pending pick without a listener renders fine')
+  // listening only: chip carries the human label, panel body skipped
+  rendered = renderWith([null, { mode: 'worktree', target: '/x/feat-x', entries: [entry] }, null, false])
+  assert.equal(rendered.args[3].args[0], 'div', 'chip renders while listening without a pending pick')
+  assert.match(rendered.args[3].args[2].args[2], /listening: repo@a1b2c3d \(feat-x\)/, 'worktree mode shows the target name')
+  rendered = renderWith([null, { mode: 'current', target: null, entries: [entry] }, null, false])
+  assert.match(rendered.args[3].args[2].args[2], /\(session worktree\)/)
+  rendered = renderWith([null, { mode: 'all', target: null, entries: [entry] }, null, false])
+  assert.match(rendered.args[3].args[2].args[2], /\(all worktrees\)/)
+}
+
+// --- restore: listeners re-arm across a settings-save reload -------------------
+// The suite imports the real module once, so module-level state (the handoff)
+// persists across apply() calls in this process — exactly like a config-only
+// fiber reload in DSH, where the loader reuses the cached module instance.
+{
+  const repo2 = join(root, 'restore')
+  mkdirSync(repo2)
+  await git(repo2, 'init', '-q', '-b', 'main')
+  await commitFile(repo2, 'base.txt', 'base\n', 'restore base')
+
+  // apply #1: start a listener and report one commit through it
+  const ctx1 = mockContext()
+  apply(ctx1)
+  const cmd1 = ctx1.registered[0]
+  const agent1 = mockAgent(repo2, 'restore-session')
+  // A second session that never starts a listener. DSH announces every agent
+  // through agent/created before any command can run in it.
+  const agentB = mockAgent(repo2, 'b-session')
+  const created1 = ctx1.listeners.find(({ event }) => event === 'agent/created')
+  created1.callback({ agent: agent1 })
+  created1.callback({ agent: agentB })
+  result = await cmd1.handler({ agent: agent1, rawInput: '' })
+  assert.equal(result.kind, 'success')
+  await commitFile(repo2, 'pre.txt', 'pre\n', 'before reload')
+  await sleep(POLL_MS + 1500)
+  assert.equal(agent1.followups.length, 1, 'pre-reload commit reported')
+
+  // The fiber dispose a settings save triggers: timers stop (lifecycle stop),
+  // the module-level handoff survives.
+  for (const dispose of ctx1.disposers) dispose()
+  await commitFile(repo2, 'gap.txt', 'gap\n', 'during reload gap')
+  await sleep(POLL_MS + 1500)
+  assert.equal(agent1.followups.length, 1, 'disposed fiber reports nothing')
+
+  // apply #2 (same module, same agent): re-arm resumes from the SAVED baseline
+  // — the gap commit fires exactly one followup, nothing is rebaselined away
+  // and nothing already reported is reported twice.
+  const ctx2 = mockContext()
+  apply(ctx2)
+  const cmd2 = ctx2.registered[0]
+  await sleep(POLL_MS + 1500)
+  assert.equal(agent1.followups.length, 2, 'gap commit fires exactly one followup after restore')
+  const restoredText = agent1.followups[1].content[0].text
+  assert.match(restoredText, /during reload gap/)
+  assert.ok(!restoredText.includes('before reload'), 'already-reported commits are not re-reported')
+
+  // The restored listener is visible to --status, and the browser routes keep
+  // resolving the existing session (agents map re-seeded from the handoff).
+  result = await cmd2.handler({ agent: agent1, rawInput: '--status' })
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /Commit listener active for this session/)
+  assert.match(result.text, /mode: current/)
+  const restoreRoute = ctx2.routes.find((entry) => entry.path === '/api/commit-listener/worktrees')
+  assert.equal(
+    (await restoreRoute.fetch(new Request('http://localhost/api/commit-listener/worktrees?session=restore-session'))).status,
+    200,
+    'restored session resolves through the re-seeded agents map',
+  )
+  // Sessions WITHOUT a listener keep route resolution too: the module-level
+  // agents mirror (not the handoff) re-seeds every fresh apply.
+  assert.equal(
+    (await restoreRoute.fetch(new Request('http://localhost/api/commit-listener/worktrees?session=b-session'))).status,
+    200,
+    'agents mirror survives the reload for listener-less sessions',
+  )
+
+  // 'off' before a dispose prevents restore: explicit stops stay off.
+  result = await cmd2.handler({ agent: agent1, rawInput: 'off' })
+  assert.equal(result.kind, 'success')
+  for (const dispose of ctx2.disposers) dispose()
+  await commitFile(repo2, 'post.txt', 'post\n', 'after explicit off')
+  const ctx3 = mockContext()
+  apply(ctx3)
+  await sleep(POLL_MS + 1500)
+  assert.equal(agent1.followups.length, 2, 'off before dispose: nothing restores')
+
+  // agent/disposed clears the handoff entry: a closed session never restores.
+  const ctxA = mockContext()
+  apply(ctxA)
+  const cmdA = ctxA.registered[0]
+  await cmdA.handler({ agent: agent1, rawInput: '' })
+  ctxA.listeners.find(({ event }) => event === 'agent/disposed').callback({ agent: agent1 })
+  for (const dispose of ctxA.disposers) dispose()
+  const ctxB = mockContext()
+  apply(ctxB)
+  await commitFile(repo2, 'gone.txt', 'gone\n', 'session gone')
+  await sleep(POLL_MS + 1500)
+  assert.equal(agent1.followups.length, 2, 'agent/disposed cleared the handoff: nothing restores')
 }
 
 rmSync(root, { recursive: true, force: true })
